@@ -6,7 +6,7 @@ A command-line sniper for UCLA Rec court reservations. Uses Playwright to drive 
 
 ## How it works at a high level
 
-- Reservations for a given court/time open **72 hours in advance**. The site is first-come-first-served, so seconds matter for popular slots.
+- Individual slots become bookable **72 hours before their start time**, and the target date's tab is visible roughly 3 calendar days out (see [`book --date`](#book---date-must-land-within-the-visible-booking-window)). The site is first-come-first-served, so seconds matter for popular slots.
 - You log in (`login`). The browser session is saved to `session.json` next to the script.
 - For a contested slot, you run `book ...` ahead of time. It sits on the facility page, keeps the session alive, and fires the click at the precise moment the booking window opens.
 - For uncontested slots you can also run `book` — it'll notice the window is already open and book immediately.
@@ -142,6 +142,7 @@ The main event: snipes a booking at the exact moment the window opens.
 ```bash
 uv run bookingbot.py book                                    # fully interactive
 uv run bookingbot.py book --sport tennis --date saturday --time 10AM
+uv run bookingbot.py book --sport tennis --date saturday --time 10AM --court 3
 uv run bookingbot.py book --sport pickleball --date +3 --time 2PM --headed
 uv run bookingbot.py book --sport tennis --date tomorrow --time "10:30 AM" --dry-run
 ```
@@ -149,6 +150,7 @@ uv run bookingbot.py book --sport tennis --date tomorrow --time "10:30 AM" --dry
 - `--sport pickleball|tennis`
 - `--date DATE` — see [date shortcuts](#date-shortcuts)
 - `--time TIME` — see [time shortcuts](#time-shortcuts)
+- `--court 2|3|4|5|6|any` — **tennis only.** Picks a specific SCRC court (2 through 6), or `any` to take whichever opens first. Prompted interactively for tennis if omitted; ignored for pickleball. ⚠️ Currently broken after the recent UCLA site update — see [Known issues](#known-issues--todos).
 - `--headed` — run the browser visible so you can watch the snipe unfold. Default is headless.
 - `--dry-run` — do everything short of actually clicking BOOK NOW. Takes a screenshot of the target slot and exits. Use this the first time you try a new slot to confirm navigation works.
 
@@ -161,7 +163,7 @@ How it actually fires:
 6. Holds until 1 second before open time, then spins in a tight loop until the exact moment.
 7. Clicks the target date tab via direct JS (bypassing Playwright's actionability waits).
 8. Polls every ~20ms for the BOOK NOW button of the target time and clicks it in JS the instant it appears.
-9. For tennis, if the button isn't on the current court tab, it cycles through the other court tabs.
+9. For tennis, if `--court` was set to a specific number, it targets that court first; if `any` (or no preference), it cycles through court tabs until one yields a button.
 10. On failure, retries up to 3 times with a fresh facility navigation between attempts.
 11. On success, saves a confirmation screenshot to `screenshots/`.
 
@@ -230,14 +232,14 @@ Times match a slot when the start hour/minute and AM/PM match. For example, `10A
 
 ## Flags — quick reference
 
-| Command | `--sport` | `--date` | `--time` | `--headed` | `--dry-run` |
-|---|---|---|---|---|---|
-| `login`   |        |        |        |        |        |
-| `status`  |        |        |        | yes    |        |
-| `list`    | yes    | yes    |        | yes    |        |
-| `book`    | yes    | yes    | yes    | yes    | yes    |
-| `cancel`  |        |        |        | yes    |        |
-| `inspect` | yes    | yes (no prompt) |   | yes    |        |
+| Command | `--sport` | `--date` | `--time` | `--court` | `--headed` | `--dry-run` |
+|---|---|---|---|---|---|---|
+| `login`   |        |        |        |        |        |        |
+| `status`  |        |        |        |        | yes    |        |
+| `list`    | yes    | yes    |        |        | yes    |        |
+| `book`    | yes    | yes    | yes    | tennis only | yes | yes |
+| `cancel`  |        |        |        |        | yes    |        |
+| `inspect` | yes    | yes (no prompt) |   |        | yes    |        |
 
 Commands that accept `--sport` or `--date` will prompt you interactively if you omit them, **except** `inspect --date` which simply uses the site's default date tab when omitted (no prompt).
 
@@ -245,9 +247,9 @@ Commands that accept `--sport` or `--date` will prompt you interactively if you 
 
 ## Quirks and edge cases
 
-### `login` has no `--headless` option
+### `login` is always headed
 
-Unlike all the other commands, `login` is always headed. This is intentional — you need the browser visible to complete the UCLA SSO and Duo prompt — but the asymmetry is worth noting. You can't script login in a fully headless pipeline.
+The other commands accept `--headed` (default is headless); `login` has no such flag — it always opens a visible browser, because you need to complete the UCLA SSO and Duo prompt by hand. You can't script `login` in a fully headless pipeline.
 
 ### Bare numbers in `--date` mean days-from-today
 
@@ -257,13 +259,13 @@ Unlike all the other commands, `login` is always headed. This is intentional —
 
 `--time 10AM` works. `--time 10:30 AM` does not — your shell splits it into two arguments and argparse sees `10:30` and chokes. Either drop the space (`--time 10:30AM`) or quote it (`--time "10:30 AM"`). Any example in the help text that uses the spaced form assumes you've quoted it.
 
-### `list` and `book` for tennis don't let you pick a specific court
+### `list` aggregates tennis courts by time
 
-Tennis has 5 sub-courts (SCRC - 2 through SCRC - 6). `book` will try every court tab when it can't find your time on the currently-visible one, which is usually what you want — but there's no way to say "I specifically want SCRC - 3". `list` similarly just shows you an aggregated view by time. If you have a strong court preference (shade, court surface, whatever), the tool currently can't express that.
+Tennis has 5 sub-courts (SCRC - 2 through SCRC - 6). `list` shows availability aggregated by time slot (with a "(N courts: SCRC - 2, SCRC - 3, ...)" annotation), not court-by-court. If you want to commit to a specific court at book time, use `book --court 3` (see [`book`](#book)). `list` itself has no `--court` flag.
 
-### `book --date` must land within the 72-hour booking window
+### `book --date` must land within the visible booking window
 
-You can't snipe a slot more than 72 hours ahead — the target date tab simply doesn't exist on the site yet. The script will fail with a "could not find date tab" error. To snipe the opening moment, pass the date of the slot you want (e.g. `--date saturday`) and run the command *before* the 72-hour window opens; it will wait.
+The site shows roughly 3 days of calendar dates as tabs — the exact cutoff is by calendar day, not a strict rolling 72 hours. For example, on Sunday just after midnight Pacific time the tabs already include the full Wednesday. If the target date tab isn't visible, the script will fail with a "could not find date tab" error. To snipe the opening moment, pass the date of the slot you want (e.g. `--date saturday`) and run the command *before* that date's tab becomes visible; the script will wait.
 
 ### The "pre-positioning on the day-before tab" step can silently fall through
 
@@ -280,6 +282,26 @@ If UCLA ever changes the booking-advance window to something other than 72 hours
 ### One booking per sport per day
 
 The UCLA Rec system only allows one reservation per sport per day. If you already have a pickleball booking for Saturday, you cannot book another pickleball slot on Saturday — the BOOK NOW buttons will be disabled. The `list` command still shows spot availability so you can relay the info to friends; it just adds a note that you can't book.
+
+---
+
+## Known issues / TODOs
+
+### Tennis `--court` selection is currently broken
+
+The UCLA Rec site got a UI refresh; the row/button selectors were updated but the **court-targeting logic in `book` has not yet been re-verified against the new tab layout**. Using `--court 3` (or any specific number) may not actually land on that court. Workaround: use `--court any` (or skip the flag) and let `book` cycle through tabs until it finds a free slot.
+
+### Screenshots can be cut off
+
+`screenshots/*.png` are taken with Playwright's default viewport, not full-page mode. If the page is long (lots of time slots, or your bookings list is long), the part you want may be below the fold. The accompanying `.html` dump (from `inspect`) contains the full DOM, so use that when a screenshot is incomplete.
+
+### `status` and screenshots only show the first 3 upcoming bookings
+
+After the site update, the home page collapses the "Upcoming" list to the first ~3 entries with a **"See more"** button to expand the rest. The bot currently scrapes the collapsed list, so the 4th-and-beyond bookings are invisible to `status` and won't appear in `cancel`'s numbered list or in confirmation screenshots. If you have more than 3 active bookings, manage the older ones in the browser.
+
+### `uv` is what's documented, but any Python env works
+
+Everything in this guide uses `uv` (commands like `uv run bookingbot.py ...`). If you'd rather use plain `python` + `pip` + a venv, that works too — the script is a single `bookingbot.py` with a normal `pyproject.toml`. Just install `playwright` and `tzdata`, run `playwright install chromium`, and invoke `python bookingbot.py ...` directly. `uv` is just the smoothest path on a fresh machine.
 
 ---
 
