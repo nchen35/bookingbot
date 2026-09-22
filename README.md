@@ -7,7 +7,7 @@ A command-line sniper for UCLA Rec court reservations. Uses Playwright to drive 
 ## How it works at a high level
 
 - Individual slots become bookable **72 hours before their start time**, and the target date's tab is visible roughly 3 calendar days out (see [`book --date`](#book---date-must-land-within-the-visible-booking-window)). The site is first-come-first-served, so seconds matter for popular slots.
-- You log in (`login`). The browser session is saved to `session.json` next to the script.
+- Logging in is automatic: any command that finds no valid session types your UCLA credentials (from env vars or `.env`) into a headless browser and you just **approve the Duo push** on your phone. The session is saved to `session.json` next to the script.
 - For a contested slot, you run `book ...` ahead of time. It sits on the facility page, keeps the session alive, and fires the click at the precise moment the booking window opens.
 - For uncontested slots you can also run `book` — it'll notice the window is already open and book immediately.
 
@@ -18,10 +18,43 @@ A command-line sniper for UCLA Rec court reservations. Uses Playwright to drive 
 ```bash
 uv sync                          # installs playwright + tzdata
 uv run playwright install chromium
-uv run bookingbot.py login       # opens a browser, complete UCLA login + Duo
+cp .env.example .env             # then fill in UCLA_USERNAME / UCLA_PASSWORD
 ```
 
-After `login`, a `session.json` file is written next to the script. Keep that file — it's your saved login and no other command works without it.
+Credentials are read from the `UCLA_USERNAME` / `UCLA_PASSWORD` environment variables, falling back to `.env` next to the script (gitignored). If neither is set, you're prompted in the terminal (not saved).
+
+That's it — the first command you run logs in by itself; approve the Duo push when the terminal says so. Login uses a persistent browser profile in `.browser_profile/` (gitignored), so after you tap "trust this browser" in Duo, later logins may not need a push at all.
+
+---
+
+## Quick typing: positional arguments and aliases
+
+`book`, `list`, and `inspect` take their main arguments positionally, in a fixed order:
+
+```
+book    [SPORT] [DATE] [TIME] [COURT]
+list    [SPORT] [DATE]
+inspect [SPORT] [DATE]
+```
+
+```bash
+uv run bookingbot.py b t sat 10 3        # tennis, next Saturday, 10 AM, court 3
+uv run bookingbot.py b pb tmr 2          # pickleball, tomorrow, 2 PM
+uv run bookingbot.py l pb +2             # list pickleball slots two days out
+uv run bookingbot.py b t sat             # prompts for time (and court)
+```
+
+- Anything left off the end is prompted for, same as omitting the flag.
+- The `--sport` / `--date` / `--time` / `--court` flags still work. Giving the same argument both ways (`b t --sport pb`) is an error.
+- The order is fixed because a bare number is ambiguous out of position (`3` is "3 days out" as a date but court 3 as a court).
+
+| Kind | Aliases |
+|---|---|
+| Commands | `b` = `book`, `l` = `list`, `s` = `status`, `c` = `cancel` |
+| Tennis | `t`, `ten`, `tennis` |
+| Pickleball | `p`, `pb`, `pickle`, `pickleball` |
+| Dates | see [date shortcuts](#date-shortcuts) |
+| Times | see [time shortcuts](#time-shortcuts) — AM/PM is optional |
 
 ---
 
@@ -32,22 +65,14 @@ After `login`, a `session.json` file is written next to the script. Keep that fi
 What this means in practice:
 
 - **Back-to-back commands work fine.** `login` → `status` → `list` → `book` in quick succession all reuse the same session.
-- **Long gaps require re-login.** If you `login`, go away for an hour, then `status`, the session will be dead. Just run `login` again.
-- **`book` keeps itself alive.** The `book` command reloads the booking page every ~2 minutes while waiting for the window to open. A `book` you start 30 minutes (or even hours) before the target time will survive because it never goes idle.
-- **Scheduled / unattended runs:** If you want to snipe a slot at a specific time without babysitting, start `book` shortly after logging in. It will wait — potentially for hours — and fire at the right moment. Don't schedule a task to run `book` hours after your last login, because the session will have expired by then.
+- **Long gaps just mean another Duo push.** If the saved session is dead, the next command logs in again automatically and asks you to approve Duo.
+- **`book` keeps itself alive.** The `book` command reloads the booking page every ~2 minutes while waiting for the window to open. If the session dies anyway (e.g. UCLA's absolute timeout), it logs in again in place — you'll get a Duo push and have ~3 minutes to approve it, otherwise the run fails.
+- **Scheduled / unattended runs:** A `book` started any time will log itself in, but that needs a Duo approval at start (and possibly mid-wait), so be near your phone.
 
 **Typical workflow:**
 
-1. `login` — complete SSO + Duo
-2. Immediately run `book --sport tennis --date saturday --time 10AM`
-3. Walk away. The script keeps the session alive and fires when the window opens.
-
-If you want to check things between login and booking, keep your commands close together:
-
-1. `login`
-2. `status` — check what you have
-3. `list --sport pickleball --date saturday` — see what's open
-4. `book --sport pickleball --date saturday --time 10AM` — go
+1. `book --sport tennis --date saturday --time 10AM` — approve Duo if prompted
+2. Walk away. The script keeps the session alive and fires when the window opens.
 
 ---
 
@@ -55,15 +80,17 @@ If you want to check things between login and booking, keep your commands close 
 
 ### `login`
 
-Opens a visible Chromium window, navigates to the booking site, and waits for you to complete the full UCLA SSO + Duo flow in the browser. It watches the URL and the Sign-In button, and the moment it detects you're logged in on the booking page it saves the session automatically — you don't need to press any keys.
+Forces a fresh login now. You normally don't need it — every other command logs in automatically when needed. Runs the same automated flow: headless browser, types your credentials, prints a prompt to approve the Duo push, saves `session.json`.
 
 ```bash
 uv run bookingbot.py login
+uv run bookingbot.py login --headed    # watch the automated login
+uv run bookingbot.py login --manual    # fallback: do the whole login by hand
 ```
 
-- No flags.
-- Timeout: 5 minutes. Close the window or let it time out to abort.
-- Run again any time the session expires.
+- `--headed` — run the automated login in a visible browser (useful if Duo ever refuses headless).
+- `--manual` — the old flow: opens a visible window and waits (up to 5 minutes) for you to complete SSO + Duo yourself.
+- Automated login gives up after 3 minutes without Duo approval, or if the UCLA form rejects your credentials.
 
 ### `status`
 
@@ -89,12 +116,13 @@ Shows every time slot on the facility page for a given sport and date, partition
 
 ```bash
 uv run bookingbot.py list                                   # fully interactive
+uv run bookingbot.py l pb tmr                               # positional + aliases
 uv run bookingbot.py list --sport tennis --date saturday
 uv run bookingbot.py list --sport pickleball --date +3
 ```
 
-- `--sport pickleball|tennis` — which facility to check. Prompted if omitted.
-- `--date DATE` — which day to check. Prompted if omitted. See [date shortcuts](#date-shortcuts) below.
+- `--sport SPORT` (or 1st positional) — `tennis`/`t` or `pickleball`/`pb`. Prompted if omitted.
+- `--date DATE` (or 2nd positional) — which day to check. Prompted if omitted. See [date shortcuts](#date-shortcuts) below.
 - `--headed` — watch the automation in a visible browser.
 
 **Note on available vs bookable:** If you already have a booking for the given sport on the given day, the site won't let you book a second one. The `list` command still shows which courts have spots (so you can, say, tell a friend), but prints a note explaining why you can't book.
@@ -141,16 +169,17 @@ The main event: snipes a booking at the exact moment the window opens.
 
 ```bash
 uv run bookingbot.py book                                    # fully interactive
+uv run bookingbot.py b t sat 10 3                            # positional + aliases
 uv run bookingbot.py book --sport tennis --date saturday --time 10AM
 uv run bookingbot.py book --sport tennis --date saturday --time 10AM --court 3
 uv run bookingbot.py book --sport pickleball --date +3 --time 2PM --headed
 uv run bookingbot.py book --sport tennis --date tomorrow --time "10:30 AM" --dry-run
 ```
 
-- `--sport pickleball|tennis`
-- `--date DATE` — see [date shortcuts](#date-shortcuts)
-- `--time TIME` — see [time shortcuts](#time-shortcuts)
-- `--court 2|3|4|5|6|any` — **tennis only.** Picks a specific SCRC court (2 through 6), or `any` to take whichever opens first. Prompted interactively for tennis if omitted; ignored for pickleball. ⚠️ Currently broken after the recent UCLA site update — see [Known issues](#known-issues--todos).
+- `--sport SPORT` (1st positional) — `tennis`/`t` or `pickleball`/`pb`
+- `--date DATE` (2nd positional) — see [date shortcuts](#date-shortcuts)
+- `--time TIME` (3rd positional) — see [time shortcuts](#time-shortcuts)
+- `--court 2|3|4|5|6|any` (4th positional) — **tennis only.** Picks a specific SCRC court (2 through 6), or `any` to take whichever opens first. Prompted interactively for tennis if omitted; ignored for pickleball. ⚠️ Currently broken after the recent UCLA site update — see [Known issues](#known-issues--todos).
 - `--headed` — run the browser visible so you can watch the snipe unfold. Default is headless.
 - `--dry-run` — do everything short of actually clicking BOOK NOW. Takes a screenshot of the target slot and exits. Use this the first time you try a new slot to confirm navigation works.
 
@@ -192,8 +221,8 @@ uv run bookingbot.py inspect --sport tennis
 uv run bookingbot.py inspect --sport pickleball --date saturday --headed
 ```
 
-- `--sport pickleball|tennis` — prompted if omitted.
-- `--date DATE` — optional. If given, clicks that date tab before dumping. If omitted, inspects whatever date tab the site defaults to (today). Does **not** prompt.
+- `--sport SPORT` (1st positional) — prompted if omitted.
+- `--date DATE` (2nd positional) — optional. If given, clicks that date tab before dumping. If omitted, inspects whatever date tab the site defaults to (today). Does **not** prompt.
 - `--headed` — run visible.
 
 Output is printed to the terminal and also written to `screenshots/inspect_<sport>_<timestamp>.{png,html}`.
@@ -202,14 +231,14 @@ Output is printed to the terminal and also written to `screenshots/inspect_<spor
 
 ## Date shortcuts
 
-`book --date`, `list --date`, and `inspect --date` all accept:
+The DATE argument of `book`, `list`, and `inspect` (positional or `--date`) accepts:
 
 | Input | Meaning |
 |---|---|
 | `2026-04-18` | ISO date |
 | `today` | today |
-| `tomorrow` | tomorrow |
-| `monday`, `mon`, `tuesday`, `tue`, ... | next occurrence of that weekday (if today is that weekday, means *next week*) |
+| `tomorrow`, `tmr`, `tmrw`, `tom` | tomorrow |
+| `monday`, `mon`, `mo`, `tuesday`, `tue`, `tu`, ... `saturday`, `sat`, `sa` | next occurrence of that weekday (if today is that weekday, means *next week*) |
 | `+3` | 3 days from today |
 | `3` | same as `+3` — bare numbers are treated as day offsets |
 
@@ -217,14 +246,17 @@ All dates are interpreted in **America/Los_Angeles** time, not your local clock.
 
 ## Time shortcuts
 
-`book --time` accepts any of:
+`book`'s TIME argument (positional or `--time`) accepts any of:
 
 | Input | Meaning |
 |---|---|
+| `10`, `2`, `10:30` | AM/PM inferred: 8–11 → AM, 12 and 1–7 → PM (see below) |
 | `10AM`, `10am` | 10:00 AM |
 | `2PM` | 2:00 PM |
 | `10:30 AM` | 10:30 AM (quote it in the shell: `--time "10:30 AM"`) |
 | `10:30AM` | same, no space needed |
+
+**Assumption: court reservations run 8 AM – 8 PM** (the last slot starts at 7 PM). That's what makes a bare hour unambiguous. If UCLA changes the hours (e.g. to allow 7 AM or 8 PM slots), a bare `7` or `8` would resolve to the wrong half of the day. Add AM/PM explicitly in that case, or update `FIRST_AM_HOUR` near the top of `bookingbot.py`.
 
 Times match a slot when the start hour/minute and AM/PM match. For example, `10AM` matches a slot labeled `10 - 10:30 AM` or `10 - 10:50 AM`.
 
@@ -234,30 +266,34 @@ Times match a slot when the start hour/minute and AM/PM match. For example, `10A
 
 | Command | `--sport` | `--date` | `--time` | `--court` | `--headed` | `--dry-run` |
 |---|---|---|---|---|---|---|
-| `login`   |        |        |        |        |        |        |
+| `login`   |        |        |        |        | yes (+ `--manual`) |        |
 | `status`  |        |        |        |        | yes    |        |
 | `list`    | yes    | yes    |        |        | yes    |        |
 | `book`    | yes    | yes    | yes    | tennis only | yes | yes |
 | `cancel`  |        |        |        |        | yes    |        |
 | `inspect` | yes    | yes (no prompt) |   |        | yes    |        |
 
-Commands that accept `--sport` or `--date` will prompt you interactively if you omit them, **except** `inspect --date` which simply uses the site's default date tab when omitted (no prompt).
+Every flag except `--headed`, `--dry-run`, and `--manual` can also be given positionally (see [Quick typing](#quick-typing-positional-arguments-and-aliases)). Commands that accept `--sport` or `--date` will prompt you interactively if you omit them, **except** `inspect --date` which simply uses the site's default date tab when omitted (no prompt).
 
 ---
 
 ## Quirks and edge cases
 
-### `login` is always headed
+### Auto-login follows `--headed`
 
-The other commands accept `--headed` (default is headless); `login` has no such flag — it always opens a visible browser, because you need to complete the UCLA SSO and Duo prompt by hand. You can't script `login` in a fully headless pipeline.
+When a command needs to log in, the login browser is headless unless you passed `--headed`, in which case it's visible too. Duo approval always happens on your phone either way.
 
-### Bare numbers in `--date` mean days-from-today
+### Only one login at a time
 
-`--date 3` and `--date +3` both mean "three days from today". If you expect `3` to mean "the 3rd of this month", you'll be surprised. The `+` prefix is the safer, more intentional form.
+Auto-login uses the `.browser_profile/` directory, which Chromium locks while it's open. If two commands try to log in simultaneously, the second fails with a "could not open browser profile" error — just re-run it.
 
-### `--time` with a space needs shell quoting
+### Bare numbers as a DATE mean days-from-today
 
-`--time 10AM` works. `--time 10:30 AM` does not — your shell splits it into two arguments and argparse sees `10:30` and chokes. Either drop the space (`--time 10:30AM`) or quote it (`--time "10:30 AM"`). Any example in the help text that uses the spaced form assumes you've quoted it.
+`--date 3` and `--date +3` (or `b t 3 10`) all mean "three days from today". If you expect `3` to mean "the 3rd of this month", you'll be surprised. The `+` prefix is the safer, more intentional form.
+
+### A time with a space needs shell quoting
+
+`--time 10AM` works, and so does `--time 10:30` (AM/PM inferred). `--time 10:30 AM` does not — your shell splits it into two arguments and argparse sees `10:30` and chokes. Either drop the space (`--time 10:30AM`) or quote it (`--time "10:30 AM"`). Any example in the help text that uses the spaced form assumes you've quoted it.
 
 ### `list` aggregates tennis courts by time
 
@@ -308,7 +344,6 @@ Everything in this guide uses `uv` (commands like `uv run bookingbot.py ...`). I
 ## Tips
 
 - **Always `--dry-run` a new target first.** The navigation, date-tab click, and slot-matching logic can break subtly when the site changes. A dry run takes a screenshot of the target slot and proves end-to-end navigation before you rely on the snipe.
-- **Start `book` right after `login`.** Since the session expires in ~5 minutes of inactivity, the safest pattern is `login` → `book` immediately. The book command handles the wait internally.
 - **Use `--headed` the first few times.** Watching the snipe happen once or twice makes the failure modes much easier to reason about.
 - **After a failed snipe, check `screenshots/failed_*.png`.** The script writes a screenshot on every failure path, which almost always tells you immediately whether the issue was the facility nav, the date tab, or the BOOK NOW button.
-- **Re-run `login` at the first sign of trouble.** Many "can't find" errors are actually silent session expiry — the page redirects to the SSO form, and every selector on the booking page is suddenly gone.
+- **Run `login` at the first sign of trouble.** Many "can't find" errors are actually silent session expiry — the page redirects to the SSO form, and every selector on the booking page is suddenly gone. `login` forces a fresh session.

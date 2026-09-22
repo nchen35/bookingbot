@@ -2,23 +2,32 @@
 """
 UCLA Rec Booking Sniper
 
+Commands log in automatically when the saved session is missing or expired:
+credentials come from UCLA_USERNAME / UCLA_PASSWORD (env or .env), and you
+approve the Duo push on your phone.
+
 Usage:
-  python bookingbot.py login
-  python bookingbot.py list                                  # interactive sport/date
-  python bookingbot.py list --sport tennis --date saturday
-  python bookingbot.py book                                  # fully interactive
-  python bookingbot.py book --sport pickleball --date saturday --time 10AM
-  python bookingbot.py book --sport tennis --date +3 --time 2PM --headed
-  python bookingbot.py book --sport pickleball --date tomorrow --time "10:00 AM" --dry-run
+  uv run bookingbot.py login                                 # force a fresh login
+  uv run bookingbot.py list                                  # interactive sport/date
+  uv run bookingbot.py list pb tmr                           # positional + aliases
+  uv run bookingbot.py list --sport tennis --date saturday
+  uv run bookingbot.py book                                  # fully interactive
+  uv run bookingbot.py b t sat 10 3                          # tennis, Sat 10 AM, court 3
+  uv run bookingbot.py book --sport pickleball --date saturday --time 10AM
+  uv run bookingbot.py book --sport tennis --date +3 --time 2PM --headed
+  uv run bookingbot.py book --sport pickleball --date tomorrow --time "10:00 AM" --dry-run
 """
 
 import argparse
 import asyncio
+import getpass
+import os
 import re
 import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
@@ -27,6 +36,12 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 
 SESSION_FILE = Path(__file__).parent / "session.json"
 SCREENSHOTS_DIR = Path(__file__).parent / "screenshots"
+# Persistent Chromium profile used only for auto-login, so Duo's "trust this
+# browser" and the UCLA IdP cookies survive between logins.
+PROFILE_DIR = Path(__file__).parent / ".browser_profile"
+# Optional KEY=VALUE file holding UCLA_USERNAME / UCLA_PASSWORD (gitignored).
+ENV_FILE = Path(__file__).parent / ".env"
+LOGIN_TIMEOUT_SECS = 180  # how long auto-login waits for SSO + Duo approval
 BOOKING_URL = "https://secure.recreation.ucla.edu/booking"
 LA_TZ = ZoneInfo("America/Los_Angeles")
 BOOKING_ADVANCE_HOURS = 72  # slots open this many hours before the court time
@@ -41,7 +56,9 @@ FACILITY_CARD_NAMES = {
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def is_session_expired(url: str) -> bool:
-    return any(x in url.lower() for x in ("login", "sign-in", "idp.ucla.edu", "shibboleth"))
+    return any(x in url.lower() for x in (
+        "login", "sign-in", "idp.ucla.edu", "shibboleth", "shb.ais.ucla.edu", "logon.ucla.edu",
+    ))
 
 
 async def check_logged_in(page) -> bool:
@@ -112,32 +129,53 @@ def time_matches_slot(user_time: str, slot_text: str) -> bool:
 # ── Input shortcuts ───────────────────────────────────────────────────────────
 
 WEEKDAYS = {
-    "monday": 0, "mon": 0,
-    "tuesday": 1, "tue": 1, "tues": 1,
-    "wednesday": 2, "wed": 2,
-    "thursday": 3, "thu": 3, "thurs": 3,
-    "friday": 4, "fri": 4,
-    "saturday": 5, "sat": 5,
-    "sunday": 6, "sun": 6,
+    "monday": 0, "mon": 0, "mo": 0,
+    "tuesday": 1, "tue": 1, "tues": 1, "tu": 1,
+    "wednesday": 2, "wed": 2, "we": 2,
+    "thursday": 3, "thu": 3, "thurs": 3, "th": 3,
+    "friday": 4, "fri": 4, "fr": 4,
+    "saturday": 5, "sat": 5, "sa": 5,
+    "sunday": 6, "sun": 6, "su": 6,
 }
+
+TOMORROW_ALIASES = ("tomorrow", "tmr", "tmrw", "tom")
+
+SPORT_ALIASES = {
+    "tennis": "tennis", "t": "tennis", "ten": "tennis",
+    "pickleball": "pickleball", "p": "pickleball", "pb": "pickleball", "pickle": "pickleball",
+}
+
+# Reservations currently run 8 AM - 8 PM (last slot starts 7 PM), so a bare
+# hour is unambiguous: 8-11 → AM, 12 and 1-7 → PM.
+FIRST_AM_HOUR = 8
+
+
+def parse_sport(s: str) -> str:
+    sport = SPORT_ALIASES.get(s.strip().lower())
+    if sport is None:
+        raise ValueError(
+            f"Invalid sport '{s}'. Use tennis (t, ten) or pickleball (p, pb, pickle)."
+        )
+    return sport
 
 
 def parse_time_shortcut(s: str) -> str:
     """
     Normalize flexible time input to canonical 'H:MM AM/PM' form.
-    Accepts: '10AM', '2pm', '10:30 AM', '10:00AM', '2:15 pm'.
+    Accepts: '10AM', '2pm', '10:30 AM', '10:00AM', '2:15 pm', and bare
+    '10' / '2' / '10:30' (AM/PM inferred from the 8 AM - 8 PM court hours).
     """
     raw = s.strip().upper().replace(" ", "")
-    m = re.match(r"^(\d{1,2})(?::(\d{2}))?(AM|PM)$", raw)
+    m = re.match(r"^(\d{1,2})(?::(\d{2}))?(AM|PM)?$", raw)
     if not m:
         raise ValueError(
-            f"Invalid time format: '{s}'. Try '10:00 AM', '10AM', or '2:30 PM'."
+            f"Invalid time format: '{s}'. Try '10', '2PM', or '10:30 AM'."
         )
     hour = int(m.group(1))
     minute = int(m.group(2) or 0)
-    ampm = m.group(3)
     if not (1 <= hour <= 12) or not (0 <= minute <= 59):
         raise ValueError(f"Time out of range: '{s}'.")
+    ampm = m.group(3) or ("AM" if FIRST_AM_HOUR <= hour < 12 else "PM")
     return f"{hour}:{minute:02d} {ampm}"
 
 
@@ -160,7 +198,7 @@ def parse_date_shortcut(s: str) -> str:
 
     if raw == "today":
         return today.isoformat()
-    if raw == "tomorrow":
+    if raw in TOMORROW_ALIASES:
         return (today + timedelta(days=1)).isoformat()
 
     if raw.startswith("+") or raw.lstrip("+").isdigit():
@@ -201,18 +239,11 @@ def prompt_until_valid(prompt: str, validator, default: str | None = None) -> st
 
 def resolve_sport(sport: str | None) -> str:
     if sport:
-        sport = sport.strip().lower()
-        if sport not in FACILITY_CARD_NAMES:
-            print(f"Invalid sport '{sport}'. Must be one of: {list(FACILITY_CARD_NAMES)}")
-            sport = None
-    if sport is None:
-        def _v(raw: str) -> str:
-            raw = raw.strip().lower()
-            if raw not in FACILITY_CARD_NAMES:
-                raise ValueError(f"Must be one of: {', '.join(FACILITY_CARD_NAMES)}")
-            return raw
-        sport = prompt_until_valid("Sport (pickleball/tennis)", _v)
-    return sport
+        try:
+            return parse_sport(sport)
+        except ValueError as e:
+            print(f"  {e}")
+    return prompt_until_valid("Sport (t/tennis, pb/pickleball)", parse_sport)
 
 
 def resolve_date(date_str: str | None) -> str:
@@ -222,7 +253,7 @@ def resolve_date(date_str: str | None) -> str:
         except ValueError as e:
             print(f"  {e}")
     return prompt_until_valid(
-        "Date (YYYY-MM-DD, today, tomorrow, saturday, +3)",
+        "Date (YYYY-MM-DD, today, tmr, sat, +3)",
         parse_date_shortcut,
     )
 
@@ -234,7 +265,7 @@ def resolve_time(time_str: str | None) -> str:
         except ValueError as e:
             print(f"  {e}")
     return prompt_until_valid(
-        "Time (e.g. '10AM', '2PM', '10:30 AM')",
+        "Time (e.g. 10, 2, 10:30, 2PM)",
         parse_time_shortcut,
     )
 
@@ -290,7 +321,229 @@ def resolve_booking_args(
 
 # ── Login ─────────────────────────────────────────────────────────────────────
 
-async def cmd_login():
+# True once the page is back on a recreation.ucla.edu page with the Sign In
+# button gone. After the SSO update, login lands on the home page
+# (secure.recreation.ucla.edu) rather than /booking, so '/booking' isn't required.
+LOGGED_IN_JS = """() => {
+    const url = window.location.href;
+    if (!url.includes('recreation.ucla.edu')) return false;
+    if (url.includes('idp.ucla.edu') || url.includes('shibboleth')) return false;
+    const signInVisible = Array.from(document.querySelectorAll('*')).some(
+        el => el.children.length === 0 &&
+              (el.textContent || '').trim() === 'Sign In' &&
+              el.offsetParent !== null
+    );
+    return !signInVisible;
+}"""
+
+# Duo prompt buttons worth clicking while waiting for approval. "Trust browser"
+# is what makes later logins from the persistent profile quicker.
+DUO_HELPER_BUTTONS = (
+    "Yes, trust browser", "Yes, this is my device", "Send me a Push", "Try again",
+)
+
+
+class LoginError(RuntimeError):
+    pass
+
+
+_credentials: tuple[str, str] | None = None  # cached so a re-login mid-wait doesn't re-prompt
+
+
+def _read_env_file() -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not ENV_FILE.exists():
+        return values
+    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip().removeprefix("export ").strip()
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        values[key] = val
+    return values
+
+
+def load_credentials() -> tuple[str, str]:
+    """UCLA credentials from env vars, then .env, then an interactive prompt."""
+    global _credentials
+    if _credentials:
+        return _credentials
+    file_vals = _read_env_file()
+    user = os.environ.get("UCLA_USERNAME") or file_vals.get("UCLA_USERNAME", "")
+    pw = os.environ.get("UCLA_PASSWORD") or file_vals.get("UCLA_PASSWORD", "")
+    if not (user and pw) and sys.stdin.isatty():
+        print("UCLA_USERNAME / UCLA_PASSWORD not set (env or .env) — enter them now "
+              "(not saved).")
+        try:
+            user = user or input("UCLA Logon ID: ").strip()
+            pw = pw or getpass.getpass("UCLA password: ")
+        except EOFError:
+            user = pw = ""
+    if not (user and pw):
+        raise LoginError(f"Set UCLA_USERNAME and UCLA_PASSWORD in the environment or {ENV_FILE}.")
+    _credentials = (user, pw)
+    return _credentials
+
+
+async def _try_click(locator, timeout: int = 400) -> bool:
+    try:
+        if await locator.is_visible():
+            await locator.click(timeout=timeout)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def auto_login(p, headless: bool = True) -> dict:
+    """Log in unattended: types UCLA credentials, user approves the Duo push.
+
+    Runs in the persistent profile (keeps Duo device trust / IdP cookies), so
+    it may complete with no Duo push at all. Saves SESSION_FILE and returns the
+    storage state. Raises LoginError on failure.
+    """
+    print(f"\nLogging in to UCLA ({'headless' if headless else 'headed'})...")
+    try:
+        context = await p.chromium.launch_persistent_context(
+            str(PROFILE_DIR), headless=headless, viewport={"width": 1280, "height": 900},
+        )
+    except Exception as e:
+        raise LoginError(
+            f"Could not open browser profile {PROFILE_DIR} — is another login running? ({e})"
+        ) from e
+
+    page = context.pages[0] if context.pages else await context.new_page()
+    try:
+        await page.goto(BOOKING_URL, wait_until="domcontentloaded")
+
+        submitted_at: float | None = None
+        last_sign_in_click = 0.0
+        deadline = time.monotonic() + LOGIN_TIMEOUT_SECS
+        while True:
+            if time.monotonic() > deadline:
+                if submitted_at is not None:
+                    raise LoginError("Timed out waiting for Duo approval.")
+                raise LoginError(f"Timed out before reaching the UCLA login form (url={page.url}).")
+
+            host = (urlparse(page.url).hostname or "").lower()
+            if host.endswith("recreation.ucla.edu") and not is_session_expired(page.url):
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=5000)
+                except PlaywrightTimeout:
+                    pass
+                try:
+                    if await page.evaluate(LOGGED_IN_JS):
+                        break
+                except Exception:
+                    pass  # navigated mid-evaluate; re-check next loop
+                # Logged out on the rec site: open the SSO flow.
+                if not await _try_click(page.get_by_text("UCLA Logon", exact=False).first):
+                    if time.monotonic() - last_sign_in_click > 5:
+                        if await _try_click(page.get_by_text("Sign In", exact=True).first):
+                            last_sign_in_click = time.monotonic()
+            else:
+                pw_box = page.locator('input[type="password"]').first
+                pw_visible = False
+                try:
+                    pw_visible = await pw_box.is_visible()
+                except Exception:
+                    pass
+                if pw_visible and submitted_at is None:
+                    user, pw = load_credentials()
+                    await page.locator('input[type="text"], input[type="email"]').first.fill(user)
+                    await pw_box.fill(pw)
+                    if not await _try_click(
+                        page.get_by_role("button", name=re.compile("sign in", re.I)).first, 5000
+                    ) and not await _try_click(
+                        page.locator('input[type="submit"], button[type="submit"]').first, 5000
+                    ):
+                        await pw_box.press("Enter")
+                    submitted_at = time.monotonic()
+                    print(">>> Credentials submitted. Approve the Duo push on your phone. <<<")
+                elif pw_visible and time.monotonic() - submitted_at > 10:
+                    # Still on the login form well after submitting.
+                    raise LoginError("UCLA login form is still showing — username/password rejected?")
+                for label in DUO_HELPER_BUTTONS:
+                    await _try_click(page.get_by_text(label, exact=False).first)
+
+            await page.wait_for_timeout(1000)
+
+        if submitted_at is None:
+            print("Signed in via saved SSO session (no Duo needed).")
+        # Land on the booking page so the saved session has the right state.
+        try:
+            await page.goto(BOOKING_URL, wait_until="domcontentloaded")
+            await page.wait_for_load_state("networkidle")
+        except Exception:
+            pass
+        state = await context.storage_state(path=str(SESSION_FILE))
+        print(f"Logged in. Session saved to {SESSION_FILE}")
+        return state
+    finally:
+        try:
+            await context.close()
+        except Exception:
+            pass
+
+
+async def open_session(p, headless: bool):
+    """Launch a browser on BOOKING_URL with a valid session, auto-logging in if
+    the saved session is missing or expired. Returns (browser, context, page);
+    exits on login failure."""
+    browser = await p.chromium.launch(headless=headless)
+    if SESSION_FILE.exists():
+        context = await browser.new_context(storage_state=str(SESSION_FILE))
+        page = await context.new_page()
+        await page.goto(BOOKING_URL)
+        await page.wait_for_load_state("networkidle")
+        if await check_logged_in(page):
+            return browser, context, page
+        await context.close()
+        print("Saved session has expired.")
+    else:
+        print("No saved session.")
+
+    try:
+        await auto_login(p, headless=headless)
+    except LoginError as e:
+        await browser.close()
+        print(f"\nError: Login failed: {e}")
+        print("Retry, or run 'uv run bookingbot.py login --manual' to log in by hand.")
+        sys.exit(1)
+
+    context = await browser.new_context(storage_state=str(SESSION_FILE))
+    page = await context.new_page()
+    await page.goto(BOOKING_URL)
+    await page.wait_for_load_state("networkidle")
+    if not await check_logged_in(page):
+        await browser.close()
+        print("\nError: Logged in, but the booking site still shows you signed out.")
+        sys.exit(1)
+    return browser, context, page
+
+
+async def relogin_context(p, context, headless: bool) -> None:
+    """Auto-login and load the fresh cookies into an already-open context."""
+    state = await auto_login(p, headless=headless)
+    await context.clear_cookies()
+    await context.add_cookies(state["cookies"])
+
+
+async def cmd_login(manual: bool, headless: bool):
+    if not manual:
+        async with async_playwright() as p:
+            try:
+                await auto_login(p, headless=headless)
+            except LoginError as e:
+                print(f"\nError: Login failed: {e}")
+                print("Retry, or run 'uv run bookingbot.py login --manual' to log in by hand.")
+                sys.exit(1)
+        return
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
         context = await browser.new_context()
@@ -307,25 +560,8 @@ async def cmd_login():
         print()
         print("Waiting for login to complete (timeout: 5 minutes)...")
 
-        # Wait until the browser is back on a recreation.ucla.edu page and the
-        # Sign In button is gone. After the SSO update, login lands on the home
-        # page (secure.recreation.ucla.edu) rather than /booking, so we no
-        # longer require '/booking' in the URL.
         try:
-            await page.wait_for_function(
-                """() => {
-                    const url = window.location.href;
-                    if (!url.includes('recreation.ucla.edu')) return false;
-                    if (url.includes('idp.ucla.edu') || url.includes('shibboleth')) return false;
-                    const signInVisible = Array.from(document.querySelectorAll('*')).some(
-                        el => el.children.length === 0 &&
-                              (el.textContent || '').trim() === 'Sign In' &&
-                              el.offsetParent !== null
-                    );
-                    return !signInVisible;
-                }""",
-                timeout=300_000,  # 5 minutes
-            )
+            await page.wait_for_function(LOGGED_IN_JS, timeout=300_000)  # 5 minutes
         except PlaywrightTimeout:
             print("Error: Timed out waiting for login. Please try again.")
             await browser.close()
@@ -341,7 +577,7 @@ async def cmd_login():
 
         await context.storage_state(path=str(SESSION_FILE))
         print(f"\nSession saved to {SESSION_FILE}")
-        print("Run 'python bookingbot.py book --help' to see booking options.")
+        print("Run 'uv run bookingbot.py book --help' to see booking options.")
         await browser.close()
 
 
@@ -353,7 +589,7 @@ async def navigate_to_facility(page, sport: str):
     await page.wait_for_load_state("networkidle")
 
     if not await check_logged_in(page):
-        raise RuntimeError("Session expired — re-run: python bookingbot.py login")
+        raise RuntimeError("Session expired — re-run the command to log in again")
 
     card_name = FACILITY_CARD_NAMES[sport]
     initial_url = page.url
@@ -655,9 +891,10 @@ async def get_court_tabs(page) -> list[str]:
 
 # ── Book: keep-alive loop ─────────────────────────────────────────────────────
 
-async def keep_alive(page, until: datetime):
+async def keep_alive(p, page, until: datetime, headless: bool):
     """
     Reload the booking home page every ~2 minutes to prevent session timeout.
+    If the session dies anyway, auto-login again (Duo push) and keep waiting.
     Stops 35 seconds before `until` so the caller can pre-position.
     """
     while True:
@@ -678,9 +915,15 @@ async def keep_alive(page, until: datetime):
         await page.wait_for_load_state("networkidle")
 
         if not await check_logged_in(page):
-            raise RuntimeError(
-                "Session expired during wait — re-run: python bookingbot.py login"
-            )
+            print("  Session expired during wait — logging in again.")
+            try:
+                await relogin_context(p, page.context, headless)
+            except LoginError as e:
+                raise RuntimeError(f"Session expired during wait and re-login failed: {e}") from e
+            await page.goto(BOOKING_URL)
+            await page.wait_for_load_state("networkidle")
+            if not await check_logged_in(page):
+                raise RuntimeError("Re-login succeeded but the booking site still shows you signed out.")
 
 
 # ── Book command ──────────────────────────────────────────────────────────────
@@ -694,9 +937,6 @@ async def cmd_book(
     dry_run: bool,
 ):
     SCREENSHOTS_DIR.mkdir(exist_ok=True)
-    if not SESSION_FILE.exists():
-        print("Error: No session file found. Run 'python bookingbot.py login' first.")
-        sys.exit(1)
 
     sport, date_str, time_str, court_pref = resolve_booking_args(sport, date_str, time_str, court_str)
 
@@ -726,21 +966,11 @@ async def cmd_book(
               "Keeping session alive until then.")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
-        context = await browser.new_context(storage_state=str(SESSION_FILE))
-        page = await context.new_page()
-
-        # Validate session
-        await page.goto(BOOKING_URL)
-        await page.wait_for_load_state("networkidle")
-        if not await check_logged_in(page):
-            print("\nError: Not logged in. Re-run 'python bookingbot.py login'.")
-            await browser.close()
-            sys.exit(1)
+        browser, context, page = await open_session(p, headless)
         print("\nSession valid.")
 
         # Keep session alive until 35 s before the booking window opens
-        await keep_alive(page, open_time)
+        await keep_alive(p, page, open_time, headless)
 
         # ── Navigate to facility ──────────────────────────────────────────────
         print("\nNavigating to facility page...")
@@ -927,10 +1157,6 @@ async def cmd_inspect(sport: str | None, date_str: str | None, headless: bool = 
     """Navigate to a facility page and dump its structure — helps find
     faster selectors for tabs, time slot rows, and BOOK NOW buttons."""
     SCREENSHOTS_DIR.mkdir(exist_ok=True)
-    if not SESSION_FILE.exists():
-        print("Error: No session file found. Run 'python bookingbot.py login' first.")
-        sys.exit(1)
-
     sport = resolve_sport(sport)
 
     # Only use a date if one was explicitly provided. Unlike `list`/`book`,
@@ -945,16 +1171,7 @@ async def cmd_inspect(sport: str | None, date_str: str | None, headless: bool = 
             sys.exit(1)
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
-        context = await browser.new_context(storage_state=str(SESSION_FILE))
-        page = await context.new_page()
-
-        await page.goto(BOOKING_URL)
-        await page.wait_for_load_state("networkidle")
-        if not await check_logged_in(page):
-            print("Error: Not logged in. Re-run 'python bookingbot.py login'.")
-            await browser.close()
-            sys.exit(1)
+        browser, context, page = await open_session(p, headless)
 
         print(f"Navigating to {sport} facility page...")
         await navigate_to_facility(page, sport)
@@ -1134,25 +1351,12 @@ async def click_court_tab(page, label: str) -> bool:
 
 async def cmd_list(sport: str | None, date_str: str | None, headless: bool):
     SCREENSHOTS_DIR.mkdir(exist_ok=True)
-    if not SESSION_FILE.exists():
-        print("Error: No session file found. Run 'python bookingbot.py login' first.")
-        sys.exit(1)
-
     sport = resolve_sport(sport)
     date_str = resolve_date(date_str)
     target_date = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=LA_TZ)
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
-        context = await browser.new_context(storage_state=str(SESSION_FILE))
-        page = await context.new_page()
-
-        await page.goto(BOOKING_URL)
-        await page.wait_for_load_state("networkidle")
-        if not await check_logged_in(page):
-            print("\nError: Not logged in. Re-run 'python bookingbot.py login'.")
-            await browser.close()
-            sys.exit(1)
+        browser, context, page = await open_session(p, headless)
 
         # Collect user's upcoming bookings from the home page so we can mark
         # slots the user has already booked in the listing below.
@@ -1515,22 +1719,8 @@ async def reveal_cancel_option(action_btn):
 
 async def cmd_status(headless: bool = True):
     """Print the user's upcoming bookings."""
-    if not SESSION_FILE.exists():
-        print("Error: No session file found. Run 'python bookingbot.py login' first.")
-        sys.exit(1)
-
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
-        context = await browser.new_context(storage_state=str(SESSION_FILE))
-        page = await context.new_page()
-
-        await page.goto(BOOKING_URL)
-        await page.wait_for_load_state("networkidle")
-
-        if not await check_logged_in(page):
-            print("\nError: Not logged in. Re-run 'python bookingbot.py login'.")
-            await browser.close()
-            sys.exit(1)
+        browser, context, page = await open_session(p, headless)
 
         bookings = await get_user_bookings_structured(page)
         await browser.close()
@@ -1554,22 +1744,8 @@ async def cmd_status(headless: bool = True):
 
 async def cmd_cancel(headless: bool = False):
     SCREENSHOTS_DIR.mkdir(exist_ok=True)
-    if not SESSION_FILE.exists():
-        print("Error: No session file found. Run 'python bookingbot.py login' first.")
-        sys.exit(1)
-
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
-        context = await browser.new_context(storage_state=str(SESSION_FILE))
-        page = await context.new_page()
-
-        await page.goto(BOOKING_URL)
-        await page.wait_for_load_state("networkidle")
-
-        if not await check_logged_in(page):
-            print("\nError: Not logged in. Re-run 'python bookingbot.py login'.")
-            await browser.close()
-            sys.exit(1)
+        browser, context, page = await open_session(p, headless)
 
         # ── Find bookings ─────────────────────────────────────────────────────
         bookings = await collect_upcoming_bookings(page)
@@ -1662,43 +1838,57 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  python bookingbot.py login
-  python bookingbot.py list                               # interactive sport/date
-  python bookingbot.py list --sport tennis --date saturday
-  python bookingbot.py book                               # fully interactive
-  python bookingbot.py book --sport pickleball --date saturday --time 10AM
-  python bookingbot.py book --sport tennis --date +3 --time 2PM --headed
-  python bookingbot.py book --sport pickleball --date tomorrow --time "10:30 AM" --dry-run
+  uv run bookingbot.py login
+  uv run bookingbot.py list                               # interactive sport/date
+  uv run bookingbot.py l pb tmr                           # positional + aliases
+  uv run bookingbot.py list --sport tennis --date saturday
+  uv run bookingbot.py book                               # fully interactive
+  uv run bookingbot.py b t sat 10 3                       # tennis, Sat 10 AM, court 3
+  uv run bookingbot.py book --sport pickleball --date saturday --time 10AM
+  uv run bookingbot.py book --sport tennis --date +3 --time 2PM --headed
+  uv run bookingbot.py book --sport pickleball --date tomorrow --time "10:30 AM" --dry-run
         """,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser(
+    login_p = subparsers.add_parser(
         "login",
-        help="Open a browser for manual login and save the session",
+        help="Log in now (types credentials from env/.env; approve the Duo push) and save the session",
+    )
+    login_p.add_argument(
+        "--manual", action="store_true",
+        help="Fallback: open a visible browser and complete the whole login by hand",
+    )
+    login_p.add_argument(
+        "--headed", action="store_true",
+        help="Run the automated login in a visible browser (default: headless)",
     )
 
+    # Shared help text for the sport/date/time/court arguments.
+    sport_help = "Sport: tennis (t, ten) or pickleball (p, pb, pickle)"
+    date_help = ("Date: YYYY-MM-DD, today, tomorrow (tmr), weekday (sat, sa), "
+                 "or +N days")
+    time_help = ("Start time: 10, 2, 10:30, 2PM, '10:30 AM' "
+                 "(AM/PM optional: 8-11 = AM, 12-7 = PM)")
+    court_help = "Tennis court number (2-6) or 'any'. Ignored for pickleball."
+
     book_p = subparsers.add_parser(
-        "book",
+        "book", aliases=["b"],
         help="Wait for the booking window to open and snipe the target slot",
+        description="Positional form: book [SPORT] [DATE] [TIME] [COURT], "
+                    "e.g. 'book t sat 10 3'. Anything omitted is prompted for.",
     )
-    book_p.add_argument(
-        "--sport", choices=["pickleball", "tennis"],
-        help="Court type (prompted if omitted)",
-    )
-    book_p.add_argument(
-        "--date", metavar="DATE",
-        help="Date: YYYY-MM-DD, 'today', 'tomorrow', weekday name, or +N "
-             "(prompted if omitted)",
-    )
-    book_p.add_argument(
-        "--time", metavar="TIME",
-        help="Start time: e.g. '10AM', '2PM', '10:30 AM' (prompted if omitted)",
-    )
+    book_p.set_defaults(command="book")
+    book_p.add_argument("sport_pos", nargs="?", metavar="SPORT", help=sport_help)
+    book_p.add_argument("date_pos", nargs="?", metavar="DATE", help=date_help)
+    book_p.add_argument("time_pos", nargs="?", metavar="TIME", help=time_help)
+    book_p.add_argument("court_pos", nargs="?", metavar="COURT", help=court_help)
+    book_p.add_argument("--sport", help=f"{sport_help} (prompted if omitted)")
+    book_p.add_argument("--date", metavar="DATE", help=f"{date_help} (prompted if omitted)")
+    book_p.add_argument("--time", metavar="TIME", help=f"{time_help} (prompted if omitted)")
     book_p.add_argument(
         "--court", metavar="COURT",
-        help="Tennis court number (2-6) or 'any'. Prompted for tennis if omitted. "
-             "Ignored for pickleball.",
+        help=f"{court_help} Prompted for tennis if omitted.",
     )
     book_p.add_argument(
         "--headed", action="store_true",
@@ -1710,36 +1900,35 @@ examples:
     )
 
     list_p = subparsers.add_parser(
-        "list",
+        "list", aliases=["l"],
         help="List all time slots on a facility page for a given date",
+        description="Positional form: list [SPORT] [DATE], e.g. 'list pb tmr'.",
     )
-    list_p.add_argument(
-        "--sport", choices=["pickleball", "tennis"],
-        help="Court type (prompted if omitted)",
-    )
-    list_p.add_argument(
-        "--date", metavar="DATE",
-        help="Date: YYYY-MM-DD, 'today', 'tomorrow', weekday name, or +N "
-             "(prompted if omitted)",
-    )
+    list_p.set_defaults(command="list")
+    list_p.add_argument("sport_pos", nargs="?", metavar="SPORT", help=sport_help)
+    list_p.add_argument("date_pos", nargs="?", metavar="DATE", help=date_help)
+    list_p.add_argument("--sport", help=f"{sport_help} (prompted if omitted)")
+    list_p.add_argument("--date", metavar="DATE", help=f"{date_help} (prompted if omitted)")
     list_p.add_argument(
         "--headed", action="store_true",
         help="Run the browser headed so you can watch (default: headless)",
     )
 
     status_p = subparsers.add_parser(
-        "status",
+        "status", aliases=["s"],
         help="Show all upcoming bookings",
     )
+    status_p.set_defaults(command="status")
     status_p.add_argument(
         "--headed", action="store_true",
         help="Run the browser headed so you can watch (default: headless)",
     )
 
     cancel_p = subparsers.add_parser(
-        "cancel",
+        "cancel", aliases=["c"],
         help="List upcoming bookings and cancel one interactively",
     )
+    cancel_p.set_defaults(command="cancel")
     cancel_p.add_argument(
         "--headed", action="store_true",
         help="Run the browser headed so you can watch (default: headless)",
@@ -1748,16 +1937,17 @@ examples:
     inspect_p = subparsers.add_parser(
         "inspect",
         help="Dump the DOM structure of a facility page (for developing selectors)",
+        description="Positional form: inspect [SPORT] [DATE].",
     )
+    inspect_p.add_argument("sport_pos", nargs="?", metavar="SPORT", help=sport_help)
+    inspect_p.add_argument("date_pos", nargs="?", metavar="DATE", help=date_help)
     inspect_p.add_argument(
-        "--sport", choices=["pickleball", "tennis"],
-        help="Which facility page to inspect (prompted if omitted)",
+        "--sport", help=f"{sport_help} (prompted if omitted)",
     )
     inspect_p.add_argument(
         "--date", metavar="DATE",
-        help="Optional date to click before dumping: YYYY-MM-DD, 'today', "
-             "'tomorrow', weekday name, or +N. If omitted, inspects the "
-             "default (today's) tab without prompting.",
+        help=f"Optional date to click before dumping. {date_help}. If omitted, "
+             "inspects the default (today's) tab without prompting.",
     )
     inspect_p.add_argument(
         "--headed", action="store_true",
@@ -1766,8 +1956,17 @@ examples:
 
     args = parser.parse_args()
 
+    # Fold positional forms into the --flag attributes; giving both is an error.
+    for name in ("sport", "date", "time", "court"):
+        pos = getattr(args, f"{name}_pos", None)
+        if pos is None:
+            continue
+        if getattr(args, name) is not None:
+            parser.error(f"{name} given both positionally ({pos!r}) and as --{name}")
+        setattr(args, name, pos)
+
     if args.command == "login":
-        asyncio.run(cmd_login())
+        asyncio.run(cmd_login(manual=args.manual, headless=not args.headed))
     elif args.command == "status":
         asyncio.run(cmd_status(headless=not args.headed))
     elif args.command == "cancel":
@@ -1789,7 +1988,6 @@ examples:
             headless=not args.headed,
             dry_run=args.dry_run,
         ))
-
 
 if __name__ == "__main__":
     main()
