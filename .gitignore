@@ -4,4 +4,3 @@ images/
 __pycache__/
 *.pyc
 .env
-.browser_profile/

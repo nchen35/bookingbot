@@ -36,9 +36,6 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 
 SESSION_FILE = Path(__file__).parent / "session.json"
 SCREENSHOTS_DIR = Path(__file__).parent / "screenshots"
-# Persistent Chromium profile used only for auto-login, so Duo's "trust this
-# browser" and the UCLA IdP cookies survive between logins.
-PROFILE_DIR = Path(__file__).parent / ".browser_profile"
 # Optional KEY=VALUE file holding UCLA_USERNAME / UCLA_PASSWORD (gitignored).
 ENV_FILE = Path(__file__).parent / ".env"
 LOGIN_TIMEOUT_SECS = 180  # how long auto-login waits for SSO + Duo approval
@@ -385,8 +382,7 @@ LOGGED_IN_JS = """() => {
     return !signInVisible;
 }"""
 
-# Duo prompt buttons worth clicking while waiting for approval. "Trust browser"
-# is what makes later logins from the persistent profile quicker.
+# Duo prompt buttons worth clicking while waiting for approval.
 DUO_HELPER_BUTTONS = (
     "Yes, trust browser", "Yes, this is my device", "Send me a Push", "Try again",
 )
@@ -451,21 +447,18 @@ async def _try_click(locator, timeout: int = 400) -> bool:
 async def auto_login(p, headless: bool = True) -> dict:
     """Log in unattended: types UCLA credentials, user approves the Duo push.
 
-    Runs in the persistent profile (keeps Duo device trust / IdP cookies), so
-    it may complete with no Duo push at all. Saves SESSION_FILE and returns the
-    storage state. Raises LoginError on failure.
+    Seeds the browser from the previous SESSION_FILE, which carries the Duo
+    cookies and the UCLA IdP session cookie. If the IdP session is still alive
+    server-side, this completes with no password or Duo push at all. Saves
+    SESSION_FILE and returns the storage state. Raises LoginError on failure.
     """
     print(f"\nLogging in to UCLA ({'headless' if headless else 'headed'})...")
-    try:
-        context = await p.chromium.launch_persistent_context(
-            str(PROFILE_DIR), headless=headless, viewport={"width": 1280, "height": 900},
-        )
-    except Exception as e:
-        raise LoginError(
-            f"Could not open browser profile {PROFILE_DIR} — is another login running? ({e})"
-        ) from e
-
-    page = context.pages[0] if context.pages else await context.new_page()
+    browser = await p.chromium.launch(headless=headless)
+    context = await browser.new_context(
+        storage_state=str(SESSION_FILE) if SESSION_FILE.exists() else None,
+        viewport={"width": 1280, "height": 900},
+    )
+    page = await context.new_page()
     try:
         await page.goto(BOOKING_URL, wait_until="domcontentloaded")
 
@@ -534,7 +527,7 @@ async def auto_login(p, headless: bool = True) -> dict:
         return state
     finally:
         try:
-            await context.close()
+            await browser.close()
         except Exception:
             pass
 

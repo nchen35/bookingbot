@@ -23,7 +23,7 @@ cp .env.example .env             # then fill in UCLA_USERNAME / UCLA_PASSWORD
 
 Credentials are read from the `UCLA_USERNAME` / `UCLA_PASSWORD` environment variables, falling back to `.env` next to the script (gitignored). If neither is set, you're prompted in the terminal (not saved).
 
-That's it — the first command you run logs in by itself; approve the Duo push when the terminal says so. Login uses a persistent browser profile in `.browser_profile/` (gitignored), so after you tap "trust this browser" in Duo, later logins may not need a push at all.
+That's it — the first command you run logs in by itself; approve the Duo push when the terminal says so. Each login starts from the cookies saved in `session.json`, so if UCLA's single sign-on session is still alive, a re-login may go through without a password or Duo push.
 
 ---
 
@@ -305,10 +305,6 @@ Every flag except `--headed`, `--dry-run`, and `--manual` can also be given posi
 ### Auto-login follows `--headed`
 
 When a command needs to log in, the login browser is headless unless you passed `--headed`, in which case it's visible too. Duo approval always happens on your phone either way.
-
-### Only one login at a time
-
-Auto-login uses the `.browser_profile/` directory, which Chromium locks while it's open. If two commands try to log in simultaneously, the second fails with a "could not open browser profile" error — just re-run it.
 
 ### Bare numbers as a DATE mean days-from-today
 
