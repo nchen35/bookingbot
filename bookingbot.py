@@ -45,6 +45,11 @@ LOGIN_TIMEOUT_SECS = 180  # how long auto-login waits for SSO + Duo approval
 BOOKING_URL = "https://secure.recreation.ucla.edu/booking"
 LA_TZ = ZoneInfo("America/Los_Angeles")
 BOOKING_ADVANCE_HOURS = 72  # slots open this many hours before the court time
+# The facility page shows this many date tabs: today plus the next 3 days. A
+# date's tab appears at midnight Pacific, VISIBLE_DATE_TABS - 1 days beforehand.
+VISIBLE_DATE_TABS = 4
+TAB_APPEAR_GRACE_SECS = 10  # wait this long past midnight before looking for a new tab
+TAB_VERIFY_TIMEOUT_SECS = 300  # keep retrying a newly-due tab this long before giving up
 
 # Text on the facility cards as it appears on the booking page.
 # Adjust these if the site changes its labels — run with --dry-run to verify navigation.
@@ -221,6 +226,42 @@ def parse_date_shortcut(s: str) -> str:
     )
 
 
+def format_day(d) -> str:
+    """'Sat Sep 26' — for user-facing messages about date tabs."""
+    return d.strftime("%a %b %d").replace(" 0", " ")
+
+
+def date_tab_visible_at(date_str: str) -> datetime:
+    """Midnight Pacific on the day the given date's tab first appears on the site."""
+    d = datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=VISIBLE_DATE_TABS - 1)
+    return d.replace(tzinfo=LA_TZ)
+
+
+def check_not_past(date_str: str) -> str:
+    """Validator: reject dates before today (Pacific)."""
+    d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    today = datetime.now(LA_TZ).date()
+    if d < today:
+        raise ValueError(f"{format_day(d)} is in the past (today is {format_day(today)}).")
+    return date_str
+
+
+def check_tab_visible(date_str: str) -> str:
+    """Validator: reject dates whose tab isn't on the facility page right now
+    (anything outside today .. today + VISIBLE_DATE_TABS - 1)."""
+    check_not_past(date_str)
+    d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    today = datetime.now(LA_TZ).date()
+    last = today + timedelta(days=VISIBLE_DATE_TABS - 1)
+    if d > last:
+        appears = date_tab_visible_at(date_str)
+        raise ValueError(
+            f"{format_day(d)} isn't on the site yet — only {format_day(today)} through "
+            f"{format_day(last)} are shown. Its tab appears {format_day(appears)} at 12:00 AM."
+        )
+    return date_str
+
+
 def prompt_until_valid(prompt: str, validator, default: str | None = None) -> str:
     """
     Repeatedly prompt until `validator(raw)` returns a value without raising.
@@ -246,15 +287,21 @@ def resolve_sport(sport: str | None) -> str:
     return prompt_until_valid("Sport (t/tennis, pb/pickleball)", parse_sport)
 
 
-def resolve_date(date_str: str | None) -> str:
+def resolve_date(date_str: str | None, check=None) -> str:
+    """Parse/prompt for a date. `check` (e.g. check_tab_visible) is an extra
+    validator run on the parsed 'YYYY-MM-DD'; failing it re-prompts."""
+    def validate(raw: str) -> str:
+        parsed = parse_date_shortcut(raw)
+        return check(parsed) if check else parsed
+
     if date_str:
         try:
-            return parse_date_shortcut(date_str)
+            return validate(date_str)
         except ValueError as e:
             print(f"  {e}")
     return prompt_until_valid(
         "Date (YYYY-MM-DD, today, tmr, sat, +3)",
-        parse_date_shortcut,
+        validate,
     )
 
 
@@ -316,7 +363,9 @@ def resolve_booking_args(
 ):
     """Normalize provided args and interactively prompt for any missing ones."""
     sport = resolve_sport(sport)
-    return sport, resolve_date(date_str), resolve_time(time_str), resolve_court(court_str, sport)
+    # Future dates are fine for book — it waits for the tab to appear.
+    date_str = resolve_date(date_str, check=check_not_past)
+    return sport, date_str, resolve_time(time_str), resolve_court(court_str, sport)
 
 
 # ── Login ─────────────────────────────────────────────────────────────────────
@@ -891,23 +940,26 @@ async def get_court_tabs(page) -> list[str]:
 
 # ── Book: keep-alive loop ─────────────────────────────────────────────────────
 
-async def keep_alive(p, page, until: datetime, headless: bool):
+async def keep_alive(
+    p, page, until: datetime, headless: bool, lead: float = 35.0, label: str = "Opens"
+):
     """
     Reload the booking home page every ~2 minutes to prevent session timeout.
     If the session dies anyway, auto-login again (Duo push) and keep waiting.
-    Stops 35 seconds before `until` so the caller can pre-position.
+    Stops `lead` seconds before `until` (default 35 s, so the caller can pre-position).
+    `label` names the event being waited for in the progress lines.
     """
     while True:
         now = datetime.now(LA_TZ)
         remaining = (until - now).total_seconds()
 
-        if remaining <= 35:
+        if remaining <= lead:
             break
 
-        sleep_secs = min(120.0, remaining - 35.0)
+        sleep_secs = min(120.0, remaining - lead)
         h = int(remaining // 3600)
         m = int((remaining % 3600) // 60)
-        print(f"  [{now.strftime('%H:%M:%S')}] Opens in {h}h {m}m. "
+        print(f"  [{now.strftime('%H:%M:%S')}] {label} in {h}h {m}m. "
               f"Next keep-alive in {int(sleep_secs)}s...")
         await asyncio.sleep(sleep_secs)
 
@@ -924,6 +976,23 @@ async def keep_alive(p, page, until: datetime, headless: bool):
             await page.wait_for_load_state("networkidle")
             if not await check_logged_in(page):
                 raise RuntimeError("Re-login succeeded but the booking site still shows you signed out.")
+
+
+async def verify_date_tab(page, sport: str, target_date: datetime):
+    """Open the facility page and click the target date tab, retrying for up
+    to TAB_VERIFY_TIMEOUT_SECS in case the site's midnight rollover lags.
+    Raises PlaywrightTimeout if the tab never shows up."""
+    deadline = time.monotonic() + TAB_VERIFY_TIMEOUT_SECS
+    while True:
+        await navigate_to_facility(page, sport)
+        try:
+            await click_date_tab(page, target_date)
+            return
+        except PlaywrightTimeout:
+            if time.monotonic() >= deadline:
+                raise
+            print("  Tab not there yet — retrying in 30s...")
+            await asyncio.sleep(30)
 
 
 # ── Book command ──────────────────────────────────────────────────────────────
@@ -947,7 +1016,12 @@ async def cmd_book(
         hour=slot_time.hour, minute=slot_time.minute, second=0, microsecond=0
     )
     open_time = target_dt - timedelta(hours=BOOKING_ADVANCE_HOURS)
+    tab_time = date_tab_visible_at(date_str)
     now = datetime.now(LA_TZ)
+
+    if target_dt <= now:
+        print(f"Error: {target_dt.strftime('%a %Y-%m-%d %I:%M %p')} has already started.")
+        sys.exit(1)
 
     label = "[DRY RUN] " if dry_run else ""
     print(f"\n=== UCLA Rec Booking Sniper {label}===")
@@ -955,11 +1029,17 @@ async def cmd_book(
     if court_pref:
         print(f"Court:         {court_pref}")
     print(f"Target slot:   {target_dt.strftime('%a %Y-%m-%d %I:%M %p %Z')}")
+    print(f"Date tab:      {tab_time.strftime('%a %Y-%m-%d %I:%M %p %Z')}")
     print(f"Booking opens: {open_time.strftime('%a %Y-%m-%d %I:%M %p %Z')}")
     print(f"Current time:  {now.strftime('%a %Y-%m-%d %I:%M %p %Z')}")
 
+    day_name = target_date.strftime("%A")
+    tab_pending = tab_time > now
     if open_time < now:
         print("\nNote: Booking window is already open — attempting to book immediately.")
+    elif tab_pending:
+        print(f"\n{day_name} tab not available yet — waiting until "
+              f"{tab_time.strftime('%a %I:%M %p')} to load it. Keeping session alive until then.")
     else:
         secs = (open_time - now).total_seconds()
         print(f"\nBooking opens in {int(secs // 3600)}h {int((secs % 3600) // 60)}m. "
@@ -968,6 +1048,27 @@ async def cmd_book(
     async with async_playwright() as p:
         browser, context, page = await open_session(p, headless)
         print("\nSession valid.")
+
+        if tab_pending:
+            # Wait for the date tab to appear, then confirm it's really there
+            # so a problem surfaces now rather than at open time.
+            await keep_alive(
+                p, page, tab_time + timedelta(seconds=TAB_APPEAR_GRACE_SECS), headless,
+                lead=0, label=f"{day_name} tab appears",
+            )
+            print(f"\n{day_name} tab should be available now — checking...")
+            try:
+                await verify_date_tab(page, sport, target_date)
+            except PlaywrightTimeout as exc:
+                shot = SCREENSHOTS_DIR / f"tab_missing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                await page.screenshot(path=shot)
+                print(f"\nError: {day_name} tab never appeared: {exc}")
+                print(f"Screenshot saved: {shot}")
+                await browser.close()
+                sys.exit(1)
+            secs = (open_time - datetime.now(LA_TZ)).total_seconds()
+            print(f"{day_name} tab found. Booking opens in "
+                  f"{int(secs // 3600)}h {int((secs % 3600) // 60)}m — keeping session alive.")
 
         # Keep session alive until 35 s before the booking window opens
         await keep_alive(p, page, open_time, headless)
@@ -1164,7 +1265,7 @@ async def cmd_inspect(sport: str | None, date_str: str | None, headless: bool = 
     target_date = None
     if date_str:
         try:
-            date_str = parse_date_shortcut(date_str)
+            date_str = check_tab_visible(parse_date_shortcut(date_str))
             target_date = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=LA_TZ)
         except ValueError as e:
             print(f"Error: {e}")
@@ -1352,7 +1453,7 @@ async def click_court_tab(page, label: str) -> bool:
 async def cmd_list(sport: str | None, date_str: str | None, headless: bool):
     SCREENSHOTS_DIR.mkdir(exist_ok=True)
     sport = resolve_sport(sport)
-    date_str = resolve_date(date_str)
+    date_str = resolve_date(date_str, check=check_tab_visible)
     target_date = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=LA_TZ)
 
     async with async_playwright() as p:
@@ -1376,7 +1477,6 @@ async def cmd_list(sport: str | None, date_str: str | None, headless: bool):
                 await click_date_tab(page, target_date)
             except PlaywrightTimeout as exc:
                 print(f"\nError: {exc}")
-                print(f"Date {date_str} may be outside the 72-hour booking window.")
                 await browser.close()
                 sys.exit(1)
 

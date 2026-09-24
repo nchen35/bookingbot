@@ -6,7 +6,7 @@ A command-line sniper for UCLA Rec court reservations. Uses Playwright to drive 
 
 ## How it works at a high level
 
-- Individual slots become bookable **72 hours before their start time**, and the target date's tab is visible roughly 3 calendar days out (see [`book --date`](#book---date-must-land-within-the-visible-booking-window)). The site is first-come-first-served, so seconds matter for popular slots.
+- Individual slots become bookable **72 hours before their start time**. The facility page always shows **4 date tabs** — today plus the next 3 days — and a date's tab appears at midnight Pacific 3 days beforehand (see [Date tabs and the booking window](#date-tabs-and-the-booking-window)). The site is first-come-first-served, so seconds matter for popular slots.
 - Logging in is automatic: any command that finds no valid session types your UCLA credentials (from env vars or `.env`) into a headless browser and you just **approve the Duo push** on your phone. The session is saved to `session.json` next to the script.
 - For a contested slot, you run `book ...` ahead of time. It sits on the facility page, keeps the session alive, and fires the click at the precise moment the booking window opens.
 - For uncontested slots you can also run `book` — it'll notice the window is already open and book immediately.
@@ -122,7 +122,7 @@ uv run bookingbot.py list --sport pickleball --date +3
 ```
 
 - `--sport SPORT` (or 1st positional) — `tennis`/`t` or `pickleball`/`pb`. Prompted if omitted.
-- `--date DATE` (or 2nd positional) — which day to check. Prompted if omitted. See [date shortcuts](#date-shortcuts) below.
+- `--date DATE` (or 2nd positional) — which day to check. Prompted if omitted. See [date shortcuts](#date-shortcuts) below. Must be one of the 4 visible date tabs (today through 3 days out); anything else is rejected before the browser opens, with a message saying when that date's tab will appear. (Today's tab may list few or no slots late in the day — past times are hidden.)
 - `--headed` — watch the automation in a visible browser.
 
 **Note on available vs bookable:** If you already have a booking for the given sport on the given day, the site won't let you book a second one. The `list` command still shows which courts have spots (so you can, say, tell a friend), but prints a note explaining why you can't book.
@@ -177,7 +177,7 @@ uv run bookingbot.py book --sport tennis --date tomorrow --time "10:30 AM" --dry
 ```
 
 - `--sport SPORT` (1st positional) — `tennis`/`t` or `pickleball`/`pb`
-- `--date DATE` (2nd positional) — see [date shortcuts](#date-shortcuts)
+- `--date DATE` (2nd positional) — see [date shortcuts](#date-shortcuts). Any date from today on is accepted, however far out; past dates and slots that have already started are rejected up front.
 - `--time TIME` (3rd positional) — see [time shortcuts](#time-shortcuts)
 - `--court 2|3|4|5|6|any` (4th positional) — **tennis only.** Picks a specific SCRC court (2 through 6), or `any` to take whichever opens first. Prompted interactively for tennis if omitted; ignored for pickleball. ⚠️ Currently broken after the recent UCLA site update — see [Known issues](#known-issues--todos).
 - `--headed` — run the browser visible so you can watch the snipe unfold. Default is headless.
@@ -185,16 +185,17 @@ uv run bookingbot.py book --sport tennis --date tomorrow --time "10:30 AM" --dry
 
 How it actually fires:
 1. Opens the booking page and validates the saved session.
-2. Computes the target open time (target slot minus 72 hours).
-3. Keeps the session alive (reloading every ~2 minutes) until 35 seconds before open time.
-4. Navigates to the facility page.
-5. Pre-positions on the day *before* the target date so the target date tab isn't yet loaded. (If the day-before tab isn't visible — e.g. the window is already open — it skips pre-positioning.)
-6. Holds until 1 second before open time, then spins in a tight loop until the exact moment.
-7. Clicks the target date tab via direct JS (bypassing Playwright's actionability waits).
-8. Polls every ~20ms for the BOOK NOW button of the target time and clicks it in JS the instant it appears.
-9. For tennis, if `--court` was set to a specific number, it targets that court first; if `any` (or no preference), it cycles through court tabs until one yields a button.
-10. On failure, retries up to 3 times with a fresh facility navigation between attempts.
-11. On success, saves a confirmation screenshot to `screenshots/`.
+2. Computes when the target date's tab appears (midnight, 3 days before) and the target open time (target slot minus 72 hours).
+3. If the date's tab isn't on the site yet, prints `<Day> tab not available yet — waiting until <time> to load it`, keeps the session alive until just after that midnight, then opens the facility page and clicks the tab to confirm it's really there (retrying for up to 5 minutes). If it never appears, it fails right then with a `tab_missing_*.png` screenshot instead of hours later at open time.
+4. Keeps the session alive (reloading every ~2 minutes) until 35 seconds before open time.
+5. Navigates to the facility page.
+6. Pre-positions on the day *before* the target date so the target date tab isn't yet loaded. (If the day-before tab isn't visible — e.g. the window is already open — it skips pre-positioning.)
+7. Holds until 1 second before open time, then spins in a tight loop until the exact moment.
+8. Clicks the target date tab via direct JS (bypassing Playwright's actionability waits).
+9. Polls every ~20ms for the BOOK NOW button of the target time and clicks it in JS the instant it appears.
+10. For tennis, if `--court` was set to a specific number, it targets that court first; if `any` (or no preference), it cycles through court tabs until one yields a button.
+11. On failure, retries up to 3 times with a fresh facility navigation between attempts.
+12. On success, saves a confirmation screenshot to `screenshots/`.
 
 Normal snipe performance on a fast network: target button clicked within ~50–200 ms of the window opening.
 
@@ -222,7 +223,7 @@ uv run bookingbot.py inspect --sport pickleball --date saturday --headed
 ```
 
 - `--sport SPORT` (1st positional) — prompted if omitted.
-- `--date DATE` (2nd positional) — optional. If given, clicks that date tab before dumping. If omitted, inspects whatever date tab the site defaults to (today). Does **not** prompt.
+- `--date DATE` (2nd positional) — optional. If given, clicks that date tab before dumping; like `list`, it must be one of the 4 visible date tabs or the command errors out before opening the browser. If omitted, inspects whatever date tab the site defaults to (today). Does **not** prompt.
 - `--headed` — run visible.
 
 Output is printed to the terminal and also written to `screenshots/inspect_<sport>_<timestamp>.{png,html}`.
@@ -243,6 +244,28 @@ The DATE argument of `book`, `list`, and `inspect` (positional or `--date`) acce
 | `3` | same as `+3` — bare numbers are treated as day offsets |
 
 All dates are interpreted in **America/Los_Angeles** time, not your local clock.
+
+### Date tabs and the booking window
+
+The facility page always shows exactly 4 date tabs: **today and the next 3 days**. A date's tab appears at **12:00 AM Pacific, 3 days before** that date. So on Tuesday the tabs are Tue–Fri, and Saturday's tab appears Wednesday at midnight.
+
+- **Today** may show few or no slots, because times that have already passed are hidden.
+- **3 days out** usually has "Not yet open" slots, because a slot only opens 72 hours before it starts. For example, on Wednesday morning Saturday 9 AM stays unbookable until Wednesday 9 AM.
+
+How each command treats the date:
+
+| Command | Accepted dates | Outside that range |
+|---|---|---|
+| `list`, `inspect` | today through 3 days out | Error before the browser opens, saying when the date's tab will appear (`list` re-prompts) |
+| `book` | today or any later date | Past dates re-prompt; a slot that has already started exits with an error |
+
+For a date whose tab hasn't appeared yet, `book` waits. Example: on Tuesday night, `b pb sat 9` prints
+
+```
+Saturday tab not available yet — waiting until Wed 12:00 AM to load it. Keeping session alive until then.
+```
+
+At midnight it opens the facility page and confirms the Saturday tab is there. Then it keeps waiting until Wednesday 9 AM and snipes the booking.
 
 ## Time shortcuts
 
@@ -299,9 +322,9 @@ Auto-login uses the `.browser_profile/` directory, which Chromium locks while it
 
 Tennis has 5 sub-courts (SCRC - 2 through SCRC - 6). `list` shows availability aggregated by time slot (with a "(N courts: SCRC - 2, SCRC - 3, ...)" annotation), not court-by-court. If you want to commit to a specific court at book time, use `book --court 3` (see [`book`](#book)). `list` itself has no `--court` flag.
 
-### `book --date` must land within the visible booking window
+### Date tabs roll over by calendar day, not a rolling 72 hours
 
-The site shows roughly 3 days of calendar dates as tabs — the exact cutoff is by calendar day, not a strict rolling 72 hours. For example, on Sunday just after midnight Pacific time the tabs already include the full Wednesday. If the target date tab isn't visible, the script will fail with a "could not find date tab" error. To snipe the opening moment, pass the date of the slot you want (e.g. `--date saturday`) and run the command *before* that date's tab becomes visible; the script will wait.
+A date's tab appears at midnight Pacific 3 days before, but each slot on it opens exactly 72 hours before its start time. For example, on Sunday just after midnight the tabs already include all of Wednesday, but Wednesday's slots open one by one through Sunday. `book` accounts for both (see [Date tabs and the booking window](#date-tabs-and-the-booking-window)). The 4-tab rule is hard-coded as `VISIBLE_DATE_TABS` near the top of `bookingbot.py`. If UCLA changes how many tabs it shows, update that constant; otherwise `list` will reject valid dates and `book` will look for the tab at the wrong time.
 
 ### The "pre-positioning on the day-before tab" step can silently fall through
 
