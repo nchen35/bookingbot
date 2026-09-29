@@ -40,6 +40,7 @@ SCREENSHOTS_DIR = Path(__file__).parent / "screenshots"
 ENV_FILE = Path(__file__).parent / ".env"
 LOGIN_TIMEOUT_SECS = 180  # how long auto-login waits for SSO + Duo approval
 BOOKING_URL = "https://secure.recreation.ucla.edu/booking"
+DEFAULT_PAGE_TIMEOUT_SECS = 30  # Playwright default; fallback for the timeout message
 LA_TZ = ZoneInfo("America/Los_Angeles")
 BOOKING_ADVANCE_HOURS = 72  # slots open this many hours before the court time
 # The facility page shows this many date tabs: today plus the next 3 days. A
@@ -2058,29 +2059,37 @@ examples:
             parser.error(f"{name} given both positionally ({pos!r}) and as --{name}")
         setattr(args, name, pos)
 
-    if args.command == "login":
-        asyncio.run(cmd_login(manual=args.manual, headless=not args.headed))
-    elif args.command == "status":
-        asyncio.run(cmd_status(headless=not args.headed))
-    elif args.command == "cancel":
-        asyncio.run(cmd_cancel(headless=not args.headed))
-    elif args.command == "inspect":
-        asyncio.run(cmd_inspect(sport=args.sport, date_str=args.date, headless=not args.headed))
-    elif args.command == "list":
-        asyncio.run(cmd_list(
-            sport=args.sport,
-            date_str=args.date,
-            headless=not args.headed,
-        ))
-    elif args.command == "book":
-        asyncio.run(cmd_book(
-            sport=args.sport,
-            date_str=args.date,
-            time_str=args.time,
-            court_str=args.court,
-            headless=not args.headed,
-            dry_run=args.dry_run,
-        ))
+    try:
+        if args.command == "login":
+            asyncio.run(cmd_login(manual=args.manual, headless=not args.headed))
+        elif args.command == "status":
+            asyncio.run(cmd_status(headless=not args.headed))
+        elif args.command == "cancel":
+            asyncio.run(cmd_cancel(headless=not args.headed))
+        elif args.command == "inspect":
+            asyncio.run(cmd_inspect(sport=args.sport, date_str=args.date, headless=not args.headed))
+        elif args.command == "list":
+            asyncio.run(cmd_list(
+                sport=args.sport,
+                date_str=args.date,
+                headless=not args.headed,
+            ))
+        elif args.command == "book":
+            asyncio.run(cmd_book(
+                sport=args.sport,
+                date_str=args.date,
+                time_str=args.time,
+                court_str=args.court,
+                headless=not args.headed,
+                dry_run=args.dry_run,
+            ))
+    except PlaywrightTimeout as exc:
+        # Usually a slow or dropped connection; avoid dumping a traceback.
+        m = re.search(r"Timeout (\d+)ms exceeded", str(exc))
+        secs = int(m.group(1)) // 1000 if m else DEFAULT_PAGE_TIMEOUT_SECS
+        print(f"\nError: Page failed to load in {secs} seconds. "
+              "Please check your network connection and try again.")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
