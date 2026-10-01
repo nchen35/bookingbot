@@ -1588,15 +1588,17 @@ def _print_slots_tennis(
     your_list: list[tuple[str, list[str]]] = []
     avail_list: list[tuple[str, list[str]]] = []
     full_list: list[str] = []
-    not_open_list: list[str] = []
+    not_open_list: list[tuple[str, list[str]]] = []
 
     for label, info in sorted_items:
         if info["booked_by_user"]:
             your_list.append((label, info["booked_by_user"]))
         elif info["available"]:
             avail_list.append((label, info["available"]))
-        elif info["not_yet_open"] and not info["full"]:
-            not_open_list.append(label)
+        elif info["not_yet_open"]:
+            # Some courts can show 0 spots before the window opens (facility
+            # holds/lessons), so one blocked court must not mark the time full.
+            not_open_list.append((label, info["not_yet_open"]))
         else:
             full_list.append(label)
 
@@ -1621,8 +1623,10 @@ def _print_slots_tennis(
 
     if not_open_list:
         print("  Not yet open:")
-        for label in not_open_list:
-            print(f"    {label}")
+        for label, courts in not_open_list:
+            n = len(courts)
+            word = "court" if n == 1 else "courts"
+            print(f"    {label}  ({n} {word}: {', '.join(courts)})")
 
 
 # ── Cancel command ───────────────────────────────────────────────────────────
