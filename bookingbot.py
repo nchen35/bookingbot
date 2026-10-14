@@ -56,9 +56,12 @@ TAB_APPEAR_GRACE_SECS = 10  # wait this long past midnight before looking for a 
 TAB_VERIFY_TIMEOUT_SECS = 300  # keep retrying a newly-due tab this long before giving up
 KEEP_ALIVE_SECS = 120  # while waiting, reload this often so the session doesn't time out
 OFFLINE_RETRY_SECS = 30  # after a failed reload (e.g. Wi-Fi dropped), retry this often
-# Longest to wait for a court's slots to load when sniping. It only matters on
-# a slow load; a court that loads without the time is skipped right away.
-SLOT_LOAD_TIMEOUT_MS = 10000
+# Longest to wait for the page to show a court's slots when sniping. It only
+# matters on a slow load; if it runs out, the next check tries again.
+SLOT_LOAD_TIMEOUT_MS = 3000
+# The site keeps showing "Opens at ..." for a few seconds after a slot really
+# opens. Keep checking this long past opening time before giving up.
+SNIPE_WINDOW_SECS = 20
 
 # Text on the facility cards as it appears on the booking page. "tennis" is
 # SCRC's tennis courts; "sycamore" is the Sycamore tennis courts.
@@ -847,6 +850,13 @@ async def click_date_tab(
     ) from last_exc
 
 
+def slot_text_parts(user_time: str) -> tuple[str, str]:
+    """Split a time like "1:00 PM" into what a slot's text starts and ends
+    with: ("1:00", "PM") matches "1:00 - 1:50 PM" but not "11:00 - 11:50 AM"."""
+    t = datetime.strptime(user_time.strip().upper(), "%I:%M %p")
+    return f"{t.hour % 12 or 12}:{t.minute:02d}", "AM" if t.hour < 12 else "PM"
+
+
 async def js_click_book_button(page, user_time: str) -> str:
     """
     Click the Book Now button in JS directly — zero Playwright auto-waiting.
@@ -854,22 +864,19 @@ async def js_click_book_button(page, user_time: str) -> str:
     this time has no Book Now button), or "loading" (they haven't loaded yet).
 
     Clicking a date or court tab empties #divBookingSlots right away, then
-    fills it with that court's slots inside a div with id "panel_<court id>"
-    (the court tab's data-facility-id), or with a "no available times"
-    message. Requiring the selected court's panel means another court's
-    leftover slots never count. Pickleball has no court tabs, so any content
-    counts there.
+    fills it with that court's slots inside a div.bookingTab_panel. The site
+    sets the panel's id to "panel_<court id>" (the court tab's
+    data-facility-id), but only if some slot has a button (Book Now or
+    Unavailable); while every slot still says "Opens at", it has no id.
+    Requiring the selected court's panel means another court's leftover
+    slots never count. Pickleball has no court tabs, so any content counts
+    there.
 
     Each slot's Book Now button has `data-apt-id` and a `data-slot-text`
     attribute like "2:00 - 2:50 PM". Matching on the attribute's start means
     "1:00" doesn't accidentally match "11:00".
     """
-    t = datetime.strptime(user_time.strip().upper(), "%I:%M %p")
-    hour_12 = t.hour % 12 or 12
-    minute = t.minute
-    ampm = "AM" if t.hour < 12 else "PM"
-    prefix = f"{hour_12}:{minute:02d}"
-
+    prefix, ampm = slot_text_parts(user_time)
     return await page.evaluate(
         """
         ({prefix, ampm}) => {
@@ -883,8 +890,9 @@ async def js_click_book_button(page, user_time: str) -> str:
                 const panel = box.querySelector(`[id="panel_${courtId}"]`);
                 if (panel) scope = panel;
                 // Another court's slots are still showing
-                else if (box.querySelector('.bookingTab_panel')) return 'loading';
-                else return 'missing';  // "no available times"
+                else if (box.querySelector('.bookingTab_panel[id^="panel_"]')) return 'loading';
+                // No buttons at all: "no available times", or all "Opens at"
+                else return 'missing';
             }
             const buttons = scope.querySelectorAll('button[data-apt-id][data-slot-text]');
             for (const btn of buttons) {
@@ -917,10 +925,91 @@ async def poll_and_js_click_book(
     deadline = time.monotonic() + (timeout_ms / 1000.0)
     while time.monotonic() < deadline:
         status = await js_click_book_button(page, user_time)
+        if status == "missing":
+            print(f"    slots shown: {await describe_slots(page)}")
         if status != "loading":
             return status
         await asyncio.sleep(0.02)
     return "timeout"
+
+
+async def describe_slots(page) -> str:
+    """One-line summary of the slots currently shown, for diagnosing a miss:
+    each Book Now button's time and spots left, or the panel's text if none."""
+    return await page.evaluate("""() => {
+        const box = document.querySelector('#divBookingSlots');
+        if (!box) return '(no slot container)';
+        const btns = [...box.querySelectorAll('button[data-apt-id][data-slot-text]')];
+        if (btns.length) return btns.map(b =>
+            `${b.getAttribute('data-slot-text')} (${b.getAttribute('data-spots-left-text') || '?'})`
+        ).join(' | ');
+        return '(no Book Now buttons) ' + box.innerText.replace(/\\s+/g, ' ').slice(0, 300);
+    }""")
+
+
+async def slot_urls(page, sample_url: str, court_pref: str | None) -> list[tuple[str | None, str]]:
+    """List (court tab label, slots URL) for each court to watch. The page loads
+    a court's slots from .../slots/<court id>/<year>/<month>/<day>, and
+    `sample_url` is one it requested for the target date, so swapping in each
+    court tab's id gives the rest. Pickleball has no court tabs, so it's just
+    [(None, sample_url)]. With `court_pref`, only that court."""
+    base, rest = sample_url.split("/slots/", 1)
+    date_part = rest.split("/", 1)[1]
+    courts = await page.evaluate("""() => [...document.querySelectorAll(
+        '#tabBookingFacilities [role=tab][data-facility-id]')].map(
+        t => [t.innerText.trim(), t.getAttribute('data-facility-id')])""")
+    if not courts:
+        return [(None, sample_url)]
+    urls = [(label, f"{base}/slots/{court_id}/{date_part}")
+            for label, court_id in courts if court_pref in (None, label)]
+    if not urls:
+        raise RuntimeError(f"No court tab '{court_pref}' on the page "
+                           f"(found {', '.join(label for label, _ in courts)}).")
+    return urls
+
+
+async def fetch_slot_state(page, url: str, user_time: str) -> str:
+    """Fetch one court's slots straight from the server, without touching the
+    page, and say where `user_time` stands: "open" (has a Book Now button),
+    "pending" (still says "Opens at ..."), "taken" (full, or not offered), or
+    "error" (the request failed)."""
+    prefix, ampm = slot_text_parts(user_time)
+    return await page.evaluate(
+        """
+        async ({url, prefix, ampm}) => {
+            const isTarget = s => {
+                s = (s || '').trim();
+                return s.startsWith(prefix + ' -') && s.toUpperCase().endsWith(ampm);
+            };
+            try {
+                const res = await fetch(url, {credentials: 'same-origin', cache: 'no-store'});
+                if (!res.ok || res.redirected) return 'error';
+                const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+                for (const b of doc.querySelectorAll('button[data-apt-id][data-slot-text]'))
+                    if (isTarget(b.getAttribute('data-slot-text'))) return 'open';
+                for (const card of doc.querySelectorAll('.card')) {
+                    const heading = card.querySelector('strong');
+                    if (heading && isTarget(heading.textContent))
+                        return /Opens at/i.test(card.textContent) ? 'pending' : 'taken';
+                }
+                return 'taken';
+            } catch (e) {
+                return 'error';
+            }
+        }
+        """,
+        {"url": url, "prefix": prefix, "ampm": ampm},
+    )
+
+
+async def show_court(page, court: str | None, target_date: datetime) -> None:
+    """Make the page (re)load `court`'s slots for the date tab already
+    selected. Clicking a tab that's already selected still reloads it. With no
+    court tabs (pickleball), re-click the target date's tab instead."""
+    if court:
+        await click_court_tab(page, court)
+    else:
+        await click_date_tab(page, target_date, wait_networkidle=False)
 
 
 async def wait_for_slots(page, timeout: int = 8000):
@@ -1189,39 +1278,14 @@ async def cmd_book(
         print("\nNavigating to facility page...")
         await navigate_to_facility(page, facility)
 
-        already_open = open_time <= datetime.now(LA_TZ)
-        pre_date = target_date - timedelta(days=1)
-
-        if already_open:
-            # Booking window is open now — go straight to the target date tab.
-            print("Booking window already open. Navigating directly to target date...")
-        else:
-            # ── Pre-position ──────────────────────────────────────────────────
-            # Sit on the day-before tab so the target date tab is not yet loaded.
-            try:
-                print(f"Pre-positioning on {format_date_tab(pre_date)} tab...")
-                await click_date_tab(page, pre_date)
-            except PlaywrightTimeout:
-                print("Adjacent date tab not available; will navigate directly at open time.")
-
-            # Wait until T-1 s
-            now = datetime.now(LA_TZ)
-            remaining = (open_time - now).total_seconds()
-            if remaining > 1.0:
-                print(f"Holding for {remaining:.1f}s...")
-                await asyncio.sleep(remaining - 1.0)
-
-            # ── Sniper ────────────────────────────────────────────────────────
-            # Tight loop until open_time, then click the target date tab.
-            while datetime.now(LA_TZ) < open_time:
-                await asyncio.sleep(0.02)
-
-        fire_ts = datetime.now(LA_TZ).strftime("%H:%M:%S.%f")
-        print(f"\n[{fire_ts}] Firing: clicking {format_date_tab(target_date)} tab...")
-        t_fire = time.monotonic()
+        # ── Pre-position ──────────────────────────────────────────────────────
+        # Sit on the target date's tab, noting the URL the page loads its slots
+        # from, so the slots can be fetched directly at opening time.
+        print(f"Loading the {format_date_tab(target_date)} tab...")
         try:
-            # Skip networkidle on the critical click — we poll for BOOK NOW directly.
-            await click_date_tab(page, target_date, wait_networkidle=False)
+            async with page.expect_request(lambda r: "/slots/" in r.url,
+                                           timeout=10_000) as slots_request:
+                await click_date_tab(page, target_date)
         except PlaywrightTimeout:
             shot = SCREENSHOTS_DIR / f"fire_failed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
             try:
@@ -1230,99 +1294,83 @@ async def cmd_book(
             except Exception:
                 pass
             raise
-        t_clicked = time.monotonic()
-        print(f"  [+{(t_clicked - t_fire)*1000:6.0f} ms] date tab clicked")
+        urls = await slot_urls(page, (await slots_request.value).url, court_pref)
 
-        if dry_run:
-            await wait_for_slots(page)
-            shot = SCREENSHOTS_DIR / f"dryrun_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-            await page.screenshot(path=shot)
-            print(f"[DRY RUN] Would click BOOK NOW for {time_str}.")
-            print(f"Screenshot saved: {shot}")
-            if not headless:
-                await asyncio.sleep(10)
-            await browser.close()
-            return
+        if open_time > datetime.now(LA_TZ):
+            # Wait until T-1 s, then tight-loop until open_time.
+            remaining = (open_time - datetime.now(LA_TZ)).total_seconds()
+            if remaining > 1.0:
+                print(f"Holding for {remaining:.1f}s...")
+                await asyncio.sleep(remaining - 1.0)
+            while datetime.now(LA_TZ) < open_time:
+                await asyncio.sleep(0.02)
 
-        # ── Click BOOK NOW — tight-poll, cycle court tabs, retry ─────────────
-        max_retries = 3
+        # ── Snipe ─────────────────────────────────────────────────────────────
+        # Fetch the slots one court at a time, rotating, until one shows BOOK
+        # NOW for the time, then have the page load that court and click it
+        # there. (Fetching every court at once makes the site answer some of
+        # them slowly.) The page never leaves the target date, so whatever it
+        # shows is for the right day.
+        fire_ts = datetime.now(LA_TZ).strftime("%H:%M:%S.%f")
+        watching = ", ".join(court for court, _ in urls if court) or "the slots"
+        print(f"\n[{fire_ts}] Firing: checking {watching} for {time_str}...")
+        t_fire = time.monotonic()
+
+        def elapsed() -> str:
+            return f"[+{(time.monotonic() - t_fire)*1000:6.0f} ms]"
+
+        states: dict[str | None, str | None] = {court: None for court, _ in urls}
         booked = False
+        turn = 0
+        while not booked and time.monotonic() - t_fire < SNIPE_WINDOW_SECS:
+            live = [(court, url) for court, url in urls if states[court] != "taken"]
+            if not live:
+                break
+            court, url = live[turn % len(live)]
+            turn += 1
+            state = await fetch_slot_state(page, url, time_str)
+            if state != states[court]:
+                print(f"  {elapsed()} {f'{court}: ' if court else ''}{state}")
+                states[court] = state
+            if state != "open":
+                continue
 
-        async def try_book_on_current_view(attempt_label: str) -> bool:
-            """Try the current view plus court sub-tabs. Return True if booked.
-
-            If court_pref is set (e.g. 'SCRC - 3'), only try that court.
-            Otherwise try the current view first, then cycle all courts.
-            """
-            if court_pref:
-                # Click the preferred court tab first, then poll for BOOK NOW.
-                if await click_court_tab(page, court_pref):
-                    t_poll_start = time.monotonic()
-                    status = await poll_and_js_click_book(page, time_str)
-                    t_poll_end = time.monotonic()
-                    print(f"  [+{(t_poll_end - t_fire)*1000:6.0f} ms] "
-                          f"poll {court_pref} "
-                          f"({status} in {(t_poll_end - t_poll_start)*1000:.0f} ms)")
-                    if status == "clicked":
-                        ts = datetime.now(LA_TZ).strftime("%H:%M:%S.%f")
-                        print(f"[{ts}] Clicked BOOK NOW on {court_pref} ({attempt_label}) via JS")
-                        await page.wait_for_load_state("networkidle")
-                        return True
-                else:
-                    print(f"  Warning: could not click court tab '{court_pref}'")
-                return False
-
-            # No court preference — try current view, then cycle the other courts.
-            current = await page.evaluate("""() => {
-                const tab = document.querySelector(
-                    '#tabBookingFacilities [role=tab][aria-selected=true]');
-                return tab ? tab.innerText.trim() : null;
-            }""")
-            t_poll_start = time.monotonic()
+            await show_court(page, court, target_date)
+            if dry_run:
+                await wait_for_slots(page)
+                shot = SCREENSHOTS_DIR / f"dryrun_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                await page.screenshot(path=shot)
+                print(f"[DRY RUN] Would click BOOK NOW for {time_str}"
+                      f"{f' on {court}' if court else ''}.")
+                print(f"Screenshot saved: {shot}")
+                if not headless:
+                    await asyncio.sleep(10)
+                await browser.close()
+                return
             status = await poll_and_js_click_book(page, time_str)
-            t_poll_end = time.monotonic()
-            print(f"  [+{(t_poll_end - t_fire)*1000:6.0f} ms] "
-                  f"poll {current or 'current view'} "
-                  f"({status} in {(t_poll_end - t_poll_start)*1000:.0f} ms)")
+            print(f"  {elapsed()} page shows {court or 'slots'}: {status}")
             if status == "clicked":
                 ts = datetime.now(LA_TZ).strftime("%H:%M:%S.%f")
-                print(f"[{ts}] Clicked BOOK NOW ({attempt_label}) via JS")
+                print(f"[{ts}] Clicked BOOK NOW{f' on {court}' if court else ''} via JS")
                 await page.wait_for_load_state("networkidle")
-                return True
-
-            court_tabs = await get_court_tabs(page)
-            for ct in court_tabs:
-                if ct == current:
-                    continue  # already checked above
-                if not await click_court_tab(page, ct):
-                    continue
-                t_poll_start = time.monotonic()
-                status = await poll_and_js_click_book(page, time_str)
-                t_poll_end = time.monotonic()
-                print(f"  [+{(t_poll_end - t_fire)*1000:6.0f} ms] "
-                      f"poll {ct} "
-                      f"({status} in {(t_poll_end - t_poll_start)*1000:.0f} ms)")
-                if status == "clicked":
-                    ts = datetime.now(LA_TZ).strftime("%H:%M:%S.%f")
-                    print(f"[{ts}] Clicked BOOK NOW on {ct} ({attempt_label}) via JS")
-                    await page.wait_for_load_state("networkidle")
-                    return True
-            return False
-
-        for attempt in range(1, max_retries + 1):
-            booked = await try_book_on_current_view(f"attempt {attempt}")
-            if booked or attempt == max_retries:
-                break
-
-            print(f"Attempt {attempt}: BOOK NOW not found for '{time_str}'. Re-navigating...")
-            # Re-navigate cleanly to the facility page to avoid stale/wrong page state
-            await navigate_to_facility(page, facility)
-            await click_date_tab(page, target_date, wait_networkidle=False)
+                booked = True
 
         if not booked:
+            seen = set(states.values())
+            if seen == {"taken"}:
+                target = court_pref or ("every court" if urls[0][0] else None)
+                reason = (f"{time_str} is taken or not offered"
+                          f"{f' on {target}' if target else ''}")
+            elif "open" in seen:
+                reason = f"{time_str} was open, but the page wouldn't show its BOOK NOW button"
+            elif "pending" in seen:
+                reason = (f"{time_str} still said 'Opens at' "
+                          f"{SNIPE_WINDOW_SECS}s after opening time")
+            else:
+                reason = "the UCLA site wouldn't return the slots"
             shot = SCREENSHOTS_DIR / f"failed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
             await page.screenshot(path=shot)
-            print(f"\nFailed to find BOOK NOW after {max_retries} attempts.")
+            print(f"\nCouldn't book: {reason}.")
             print(f"Screenshot saved: {shot}")
             await browser.close()
             sys.exit(1)

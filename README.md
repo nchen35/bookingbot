@@ -337,13 +337,24 @@ Each slot opens exactly 72 hours before it starts, so the newest day usually has
 ### How book times the click
 
 1. It logs in, then reloads the page every 2 minutes to stay logged in. If the internet drops, it retries every 30 seconds, right up until the slot opens.
-2. 35 seconds before the slot opens, it opens the court page and switches to the day before your date, so that clicking your date later loads fresh slots.
-3. At the moment the slot opens, it clicks your date, then looks for your time's BOOK NOW button every 20 milliseconds and clicks it as soon as it appears. If the slot was already open when you started, it skips straight to this step.
-4. For tennis with `any` court, it checks the court that's showing first, then each court in turn. With a court number, it only checks that court.
-5. If it can't find the button, it reloads and tries again, 3 tries in total. Then it stops and saves a `failed_...png` screenshot.
+2. 35 seconds before the slot opens, it opens the court page and selects your date.
+3. At the moment the slot opens, it starts asking the site for your date's slots, about every 0.1 seconds, without changing what the page shows. For tennis with `any` court, it asks about one court at a time, taking turns. With a court number, it only asks about that court. If the slot was already open when you started, it skips straight to this step.
+4. As soon as a court shows BOOK NOW for your time, it switches the page to that court and clicks BOOK NOW there.
+5. It stops and saves a `failed_...png` screenshot if your time is taken on every court it's checking, or if it still isn't open 20 seconds after opening time.
 6. After clicking BOOK NOW, it saves a `booking_confirmation_...png` screenshot of your bookings page.
 
-On a fast connection, it clicks within about 50 to 200 milliseconds of the slot opening.
+Expect the click about 2 to 3 seconds after opening time. See [Why bookings land a couple of seconds after the hour](#why-bookings-land-a-couple-of-seconds-after-the-hour).
+
+### Why bookings land a couple of seconds after the hour
+
+The UCLA site opens each slot about 2 seconds after the hour, not right on it. In a test on October 14, 2026, a 2:00 PM slot still said "Opens at 2:00 PM" at about 2:00:02, and showed BOOK NOW from about 2:00:02.4 on. That test used a computer clock within about 0.15 seconds of internet time. Two things add up to the delay:
+
+- The site's servers run about 1 second slow, and they don't all agree with each other.
+- Even by the servers' own clocks, the slot opens roughly a second after the hour.
+
+The court page never updates its list of times on its own. Anyone who loads it right at the hour, by hand or with bookingbot, sees "Opens at" and has to load it again. bookingbot keeps checking about every 0.1 seconds, so it clicks within a few tenths of a second of the slot really opening.
+
+The delay may change if UCLA fixes its clocks. If a slot ever takes more than 20 seconds to open, raise `SNIPE_WINDOW_SECS` in `bookingbot.py`.
 
 ### Staying logged in
 
@@ -375,6 +386,7 @@ If UCLA changes how booking works, you may need to edit these values in `booking
 | Setting | Value | What it is |
 |---|---|---|
 | `BOOKING_ADVANCE_HOURS` | `72` | How many hours before a slot starts it opens for booking |
+| `SNIPE_WINDOW_SECS` | `20` | How long after opening time `book` keeps checking while your time still says "Opens at" |
 | `VISIBLE_DATE_TABS` | `4` | How many days the site shows at once (today plus 3) |
 | `FIRST_AM_HOUR` | `8` | The earliest court hour, used to guess AM or PM |
 | `COURTS` | SCRC 2 to 6, Sycamore 1 to 6 | The tennis court numbers at each place |
