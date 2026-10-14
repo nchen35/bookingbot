@@ -6,16 +6,18 @@ Commands log in automatically when the saved session is missing or expired:
 credentials come from UCLA_USERNAME / UCLA_PASSWORD (env or .env), and you
 approve the Duo push on your phone.
 
-Usage:
-  uv run bookingbot.py login                                 # force a fresh login
-  uv run bookingbot.py list                                  # interactive sport/date
-  uv run bookingbot.py list pb tmr                           # positional + aliases
-  uv run bookingbot.py list --sport tennis --date saturday
-  uv run bookingbot.py book                                  # fully interactive
-  uv run bookingbot.py b t sat 10 3                          # tennis, Sat 10 AM, court 3
-  uv run bookingbot.py book --sport pickleball --date saturday --time 10AM
-  uv run bookingbot.py book --sport tennis --date +3 --time 2PM --headed
-  uv run bookingbot.py book --sport pickleball --date tomorrow --time "10:00 AM" --dry-run
+Usage (with uv, run 'uv run bookingbot.py' instead of 'python bookingbot.py'):
+  python bookingbot.py                                     # menu
+  python bookingbot.py login                               # force a fresh login
+  python bookingbot.py list                                # interactive sport/date
+  python bookingbot.py list pb tmr                         # positional + aliases
+  python bookingbot.py list --sport tennis --date saturday
+  python bookingbot.py book                                # fully interactive
+  python bookingbot.py b t sat 10 3                        # tennis, Sat 10 AM, court 3
+  python bookingbot.py b t sy sat 10 3                     # same, at Sycamore
+  python bookingbot.py book --sport pickleball --date saturday --time 10AM
+  python bookingbot.py book --sport tennis --date +3 --time 2PM --headed
+  python bookingbot.py book --sport pickleball --date tomorrow --time "10 AM"
 """
 
 import argparse
@@ -25,12 +27,15 @@ import os
 import re
 import sys
 import time
+import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+from playwright.async_api import (
+    async_playwright, Error as PlaywrightError, TimeoutError as PlaywrightTimeout,
+)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -40,7 +45,8 @@ SCREENSHOTS_DIR = Path(__file__).parent / "screenshots"
 ENV_FILE = Path(__file__).parent / ".env"
 LOGIN_TIMEOUT_SECS = 180  # how long auto-login waits for SSO + Duo approval
 BOOKING_URL = "https://secure.recreation.ucla.edu/booking"
-DEFAULT_PAGE_TIMEOUT_SECS = 30  # Playwright default; fallback for the timeout message
+# Every booking, newest first, with a Cancel button on each upcoming one.
+BOOKINGS_URL = "https://secure.recreation.ucla.edu/profile/bookings"
 LA_TZ = ZoneInfo("America/Los_Angeles")
 BOOKING_ADVANCE_HOURS = 72  # slots open this many hours before the court time
 # The facility page shows this many date tabs: today plus the next 3 days. A
@@ -48,15 +54,41 @@ BOOKING_ADVANCE_HOURS = 72  # slots open this many hours before the court time
 VISIBLE_DATE_TABS = 4
 TAB_APPEAR_GRACE_SECS = 10  # wait this long past midnight before looking for a new tab
 TAB_VERIFY_TIMEOUT_SECS = 300  # keep retrying a newly-due tab this long before giving up
+KEEP_ALIVE_SECS = 120  # while waiting, reload this often so the session doesn't time out
+OFFLINE_RETRY_SECS = 30  # after a failed reload (e.g. Wi-Fi dropped), retry this often
+# Longest to wait for a court's slots to load when sniping. It only matters on
+# a slow load; a court that loads without the time is skipped right away.
+SLOT_LOAD_TIMEOUT_MS = 10000
 
-# Text on the facility cards as it appears on the booking page.
+# Text on the facility cards as it appears on the booking page. "tennis" is
+# SCRC's tennis courts; "sycamore" is the Sycamore tennis courts.
 # Adjust these if the site changes its labels — run with --dry-run to verify navigation.
 FACILITY_CARD_NAMES = {
     "pickleball": "SCRC Pickleball Courts",
     "tennis": "SCRC Tennis Courts",
+    "sycamore": "Sycamore Tennis Courts",
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def run_hint(args: str = "") -> str:
+    """How to run this script, for hints in messages: plain Python or uv."""
+    cmd = f"bookingbot.py {args}".strip()
+    return f"'python {cmd}' (or 'uv run {cmd}')"
+
+
+def network_error_reason(exc: BaseException) -> str | None:
+    """If `exc` means the site couldn't be reached (offline, switched Wi-Fi,
+    page load timed out), a short reason like 'net::ERR_INTERNET_DISCONNECTED'.
+    None for anything else."""
+    if isinstance(exc, PlaywrightTimeout):
+        return "timed out"
+    if isinstance(exc, PlaywrightError):
+        m = re.search(r"net::ERR_\w+", str(exc))
+        if m:
+            return m.group(0)
+    return None
+
 
 def is_session_expired(url: str) -> bool:
     return any(x in url.lower() for x in (
@@ -110,25 +142,6 @@ def parse_slot_start_minute(s: str) -> int | None:
     return hour * 60 + minute
 
 
-def time_matches_slot(user_time: str, slot_text: str) -> bool:
-    """
-    Return True if a user-supplied time like '10:00 AM' matches a slot text
-    like '10 - 10:30 AM' or '10:30 - 11 AM'.
-    Matches on start-hour, start-minute (if non-zero), and AM/PM.
-    """
-    t = datetime.strptime(user_time.strip().upper(), "%I:%M %p")
-    hour_12 = t.hour % 12 or 12  # 0 → 12
-    minute = t.minute
-    ampm = "AM" if t.hour < 12 else "PM"
-
-    if minute == 0:
-        prefix = f"{hour_12} -"      # "10 -" matches "10 - 10:30 AM"
-    else:
-        prefix = f"{hour_12}:{minute:02d}"  # "10:30" matches "10:30 - 11 AM"
-
-    return prefix in slot_text and ampm in slot_text
-
-
 # ── Input shortcuts ───────────────────────────────────────────────────────────
 
 WEEKDAYS = {
@@ -148,6 +161,12 @@ SPORT_ALIASES = {
     "pickleball": "pickleball", "p": "pickleball", "pb": "pickleball", "pickle": "pickleball",
 }
 
+# Where to play tennis. Pickleball is only at SCRC.
+WHERE_ALIASES = {
+    "scrc": "scrc", "sc": "scrc", "sunset": "scrc",
+    "sycamore": "sycamore", "syc": "sycamore", "sy": "sycamore",
+}
+
 # Reservations currently run 8 AM - 8 PM (last slot starts 7 PM), so a bare
 # hour is unambiguous: 8-11 → AM, 12 and 1-7 → PM.
 FIRST_AM_HOUR = 8
@@ -162,6 +181,13 @@ def parse_sport(s: str) -> str:
     return sport
 
 
+def parse_where(s: str) -> str:
+    where = WHERE_ALIASES.get(s.strip().lower())
+    if where is None:
+        raise ValueError(f"Invalid place '{s}'. Use scrc (sc, sunset) or sycamore (sy, syc).")
+    return where
+
+
 def parse_time_shortcut(s: str) -> str:
     """
     Normalize flexible time input to canonical 'H:MM AM/PM' form.
@@ -172,7 +198,7 @@ def parse_time_shortcut(s: str) -> str:
     m = re.match(r"^(\d{1,2})(?::(\d{2}))?(AM|PM)?$", raw)
     if not m:
         raise ValueError(
-            f"Invalid time format: '{s}'. Try '10', '2PM', or '10:30 AM'."
+            f"Invalid time format: '{s}'. Try '10', '2PM', or '10 AM'."
         )
     hour = int(m.group(1))
     minute = int(m.group(2) or 0)
@@ -254,7 +280,7 @@ def check_tab_visible(date_str: str) -> str:
     if d > last:
         appears = date_tab_visible_at(date_str)
         raise ValueError(
-            f"{format_day(d)} isn't on the site yet — only {format_day(today)} through "
+            f"{format_day(d)} isn't on the site yet. Only {format_day(today)} through "
             f"{format_day(last)} are shown. Its tab appears {format_day(appears)} at 12:00 AM."
         )
     return date_str
@@ -276,6 +302,11 @@ def prompt_until_valid(prompt: str, validator, default: str | None = None) -> st
             print(f"  {e}")
 
 
+def ask_yes_no(prompt: str) -> bool:
+    """Ask a yes/no question. Anything but y or yes counts as no."""
+    return input(f"{prompt} [y/N]: ").strip().lower() in ("y", "yes")
+
+
 def resolve_sport(sport: str | None) -> str:
     if sport:
         try:
@@ -283,6 +314,26 @@ def resolve_sport(sport: str | None) -> str:
         except ValueError as e:
             print(f"  {e}")
     return prompt_until_valid("Sport (t/tennis, pb/pickleball)", parse_sport)
+
+
+def resolve_facility(sport: str, where: str | None) -> str:
+    """Turn a sport plus a place into a FACILITY_CARD_NAMES key. Tennis is at
+    SCRC or Sycamore, so it asks where if `where` is missing (Enter = SCRC).
+    Pickleball is only at SCRC."""
+    if where:
+        try:
+            where = parse_where(where)
+        except ValueError as e:
+            print(f"  {e}")
+            where = None
+    if sport != "tennis":
+        if where == "sycamore":
+            print("Error: Sycamore only has tennis courts.")
+            sys.exit(1)
+        return sport
+    if where is None:
+        where = prompt_until_valid("Where (scrc/sycamore)", parse_where, default="scrc")
+    return "sycamore" if where == "sycamore" else "tennis"
 
 
 def resolve_date(date_str: str | None, check=None) -> str:
@@ -310,20 +361,24 @@ def resolve_time(time_str: str | None) -> str:
         except ValueError as e:
             print(f"  {e}")
     return prompt_until_valid(
-        "Time (e.g. 10, 2, 10:30, 2PM)",
+        "Time (e.g. 10, 2, 2PM)",
         parse_time_shortcut,
     )
 
 
-VALID_COURTS = [2, 3, 4, 5, 6]
-COURT_TAB_PREFIX = "SCRC - "
+# Court tab label prefix and court numbers, for the facilities where you pick a court.
+COURTS = {
+    "tennis": ("SCRC - ", [2, 3, 4, 5, 6]),
+    "sycamore": ("SYCA - ", [1, 2, 3, 4, 5, 6]),
+}
 
 
-def resolve_court(court_str: str | None, sport: str) -> str | None:
+def resolve_court(court_str: str | None, facility: str) -> str | None:
     """Return a court tab label like 'SCRC - 3', or None for any court.
-    Only meaningful for tennis; returns None for pickleball."""
-    if sport != "tennis":
+    Only meaningful for facilities in COURTS; returns None for pickleball."""
+    if facility not in COURTS:
         return None
+    prefix, valid = COURTS[facility]
     if court_str is None:
         def _v(raw: str) -> str | None:
             raw = raw.strip().lower()
@@ -332,12 +387,12 @@ def resolve_court(court_str: str | None, sport: str) -> str | None:
             try:
                 n = int(raw)
             except ValueError:
-                raise ValueError(f"Must be a court number ({VALID_COURTS[0]}-{VALID_COURTS[-1]}) or 'any'.")
-            if n not in VALID_COURTS:
-                raise ValueError(f"Must be {VALID_COURTS[0]}-{VALID_COURTS[-1]} or 'any'.")
-            return f"{COURT_TAB_PREFIX}{n}"
+                raise ValueError(f"Must be a court number ({valid[0]}-{valid[-1]}) or 'any'.")
+            if n not in valid:
+                raise ValueError(f"Must be {valid[0]}-{valid[-1]} or 'any'.")
+            return f"{prefix}{n}"
         result = prompt_until_valid(
-            f"Court ({VALID_COURTS[0]}-{VALID_COURTS[-1]} or 'any')",
+            f"Court ({valid[0]}-{valid[-1]} or 'any')",
             _v,
             default="any",
         )
@@ -348,22 +403,24 @@ def resolve_court(court_str: str | None, sport: str) -> str | None:
     try:
         n = int(court_str)
     except ValueError:
-        print(f"Invalid court '{court_str}'. Must be {VALID_COURTS[0]}-{VALID_COURTS[-1]} or 'any'.")
-        return resolve_court(None, sport)
-    if n not in VALID_COURTS:
-        print(f"Invalid court '{court_str}'. Must be {VALID_COURTS[0]}-{VALID_COURTS[-1]}.")
-        return resolve_court(None, sport)
-    return f"{COURT_TAB_PREFIX}{n}"
+        print(f"Invalid court '{court_str}'. Must be {valid[0]}-{valid[-1]} or 'any'.")
+        return resolve_court(None, facility)
+    if n not in valid:
+        print(f"Invalid court '{court_str}'. Must be {valid[0]}-{valid[-1]}.")
+        return resolve_court(None, facility)
+    return f"{prefix}{n}"
 
 
 def resolve_booking_args(
-    sport: str | None, date_str: str | None, time_str: str | None, court_str: str | None = None
+    sport: str | None, where: str | None, date_str: str | None, time_str: str | None,
+    court_str: str | None = None,
 ):
-    """Normalize provided args and interactively prompt for any missing ones."""
-    sport = resolve_sport(sport)
+    """Normalize provided args and interactively prompt for any missing ones.
+    Returns (facility, date, time, court), facility being a FACILITY_CARD_NAMES key."""
+    facility = resolve_facility(resolve_sport(sport), where)
     # Future dates are fine for book — it waits for the tab to appear.
     date_str = resolve_date(date_str, check=check_not_past)
-    return sport, date_str, resolve_time(time_str), resolve_court(court_str, sport)
+    return facility, date_str, resolve_time(time_str), resolve_court(court_str, facility)
 
 
 # ── Login ─────────────────────────────────────────────────────────────────────
@@ -422,7 +479,7 @@ def load_credentials() -> tuple[str, str]:
     user = os.environ.get("UCLA_USERNAME") or file_vals.get("UCLA_USERNAME", "")
     pw = os.environ.get("UCLA_PASSWORD") or file_vals.get("UCLA_PASSWORD", "")
     if not (user and pw) and sys.stdin.isatty():
-        print("UCLA_USERNAME / UCLA_PASSWORD not set (env or .env) — enter them now "
+        print("UCLA_USERNAME / UCLA_PASSWORD not set (env or .env). Enter them now "
               "(not saved).")
         try:
             user = user or input("UCLA Logon ID: ").strip()
@@ -496,6 +553,11 @@ async def auto_login(p, headless: bool = True) -> dict:
                 except Exception:
                     pass
                 if pw_visible and submitted_at is None:
+                    # Only ever type the password into UCLA's own login page, not
+                    # e.g. a Wi-Fi sign-in page that took over the connection.
+                    if not (host == "ucla.edu" or host.endswith(".ucla.edu")):
+                        raise LoginError(f"Expected the UCLA login page but got {host or page.url}; "
+                                         "not entering your password.")
                     user, pw = load_credentials()
                     await page.locator('input[type="text"], input[type="email"]').first.fill(user)
                     await pw_box.fill(pw)
@@ -509,7 +571,7 @@ async def auto_login(p, headless: bool = True) -> dict:
                     print(">>> Credentials submitted. Approve the Duo push on your phone. <<<")
                 elif pw_visible and time.monotonic() - submitted_at > 10:
                     # Still on the login form well after submitting.
-                    raise LoginError("UCLA login form is still showing — username/password rejected?")
+                    raise LoginError("UCLA login form is still showing. Was the username or password rejected?")
                 for label in DUO_HELPER_BUTTONS:
                     await _try_click(page.get_by_text(label, exact=False).first)
 
@@ -555,7 +617,7 @@ async def open_session(p, headless: bool):
     except LoginError as e:
         await browser.close()
         print(f"\nError: Login failed: {e}")
-        print("Retry, or run 'uv run bookingbot.py login --manual' to log in by hand.")
+        print(f"Retry, or run {run_hint('login --manual')} to log in by hand.")
         sys.exit(1)
 
     context = await browser.new_context(storage_state=str(SESSION_FILE))
@@ -583,7 +645,7 @@ async def cmd_login(manual: bool, headless: bool):
                 await auto_login(p, headless=headless)
             except LoginError as e:
                 print(f"\nError: Login failed: {e}")
-                print("Retry, or run 'uv run bookingbot.py login --manual' to log in by hand.")
+                print(f"Retry, or run {run_hint('login --manual')} to log in by hand.")
                 sys.exit(1)
         return
 
@@ -620,21 +682,22 @@ async def cmd_login(manual: bool, headless: bool):
 
         await context.storage_state(path=str(SESSION_FILE))
         print(f"\nSession saved to {SESSION_FILE}")
-        print("Run 'uv run bookingbot.py book --help' to see booking options.")
+        print(f"Run {run_hint()} to open the menu.")
         await browser.close()
 
 
 # ── Book: navigation helpers ──────────────────────────────────────────────────
 
-async def navigate_to_facility(page, sport: str):
-    """Navigate from the booking home to the facility page for the given sport."""
+async def navigate_to_facility(page, facility: str):
+    """Navigate from the booking home to the page for `facility`, a
+    FACILITY_CARD_NAMES key."""
     await page.goto(BOOKING_URL)
     await page.wait_for_load_state("networkidle")
 
     if not await check_logged_in(page):
-        raise RuntimeError("Session expired — re-run the command to log in again")
+        raise RuntimeError("Session expired. Re-run the command to log in again.")
 
-    card_name = FACILITY_CARD_NAMES[sport]
+    card_name = FACILITY_CARD_NAMES[facility]
     initial_url = page.url
 
     # Try structure-aware selectors first (the card's <a>/<button>), falling
@@ -784,51 +847,22 @@ async def click_date_tab(
     ) from last_exc
 
 
-async def find_book_button(page, user_time: str):
-    """
-    Return a Playwright locator for the Book Now button of the time slot
-    matching `user_time`, or None if not found.
-
-    Each slot is a `div.card[data-slot-number]` whose Book Now button has
-    `data-apt-id` and a `data-slot-text` attribute like "2:00 - 2:50 PM".
-    We match on the button attribute directly so "1:00" doesn't accidentally
-    match "11:00".
-    """
-    t = datetime.strptime(user_time.strip().upper(), "%I:%M %p")
-    hour_12 = t.hour % 12 or 12
-    minute = t.minute
-    ampm = "AM" if t.hour < 12 else "PM"
-    prefix = f"{hour_12}:{minute:02d}"
-
-    marked = await page.evaluate(
-        """
-        ({prefix, ampm}) => {
-            document.querySelectorAll('[data-book-target="1"]').forEach(
-                el => el.removeAttribute('data-book-target')
-            );
-            const buttons = document.querySelectorAll('button[data-apt-id][data-slot-text]');
-            for (const btn of buttons) {
-                const dst = (btn.getAttribute('data-slot-text') || '').trim();
-                if (!dst.startsWith(prefix + ' -')) continue;
-                if (!dst.toUpperCase().endsWith(ampm)) continue;
-                btn.setAttribute('data-book-target', '1');
-                return true;
-            }
-            return false;
-        }
-        """,
-        {"prefix": prefix, "ampm": ampm},
-    )
-
-    if not marked:
-        return None
-    return page.locator('[data-book-target="1"]').first
-
-
-async def js_click_book_button(page, user_time: str) -> bool:
+async def js_click_book_button(page, user_time: str) -> str:
     """
     Click the Book Now button in JS directly — zero Playwright auto-waiting.
-    Returns True if a matching button was found and clicked.
+    Returns "clicked", "missing" (the selected court's slots have loaded but
+    this time has no Book Now button), or "loading" (they haven't loaded yet).
+
+    Clicking a date or court tab empties #divBookingSlots right away, then
+    fills it with that court's slots inside a div with id "panel_<court id>"
+    (the court tab's data-facility-id), or with a "no available times"
+    message. Requiring the selected court's panel means another court's
+    leftover slots never count. Pickleball has no court tabs, so any content
+    counts there.
+
+    Each slot's Book Now button has `data-apt-id` and a `data-slot-text`
+    attribute like "2:00 - 2:50 PM". Matching on the attribute's start means
+    "1:00" doesn't accidentally match "11:00".
     """
     t = datetime.strptime(user_time.strip().upper(), "%I:%M %p")
     hour_12 = t.hour % 12 or 12
@@ -839,49 +873,54 @@ async def js_click_book_button(page, user_time: str) -> bool:
     return await page.evaluate(
         """
         ({prefix, ampm}) => {
-            const buttons = document.querySelectorAll('button[data-apt-id][data-slot-text]');
+            const box = document.querySelector('#divBookingSlots');
+            if (!box || box.children.length === 0) return 'loading';
+            let scope = box;
+            const tab = document.querySelector(
+                '#tabBookingFacilities [role=tab][aria-selected=true]');
+            const courtId = tab && tab.getAttribute('data-facility-id');
+            if (courtId) {
+                const panel = box.querySelector(`[id="panel_${courtId}"]`);
+                if (panel) scope = panel;
+                // Another court's slots are still showing
+                else if (box.querySelector('.bookingTab_panel')) return 'loading';
+                else return 'missing';  // "no available times"
+            }
+            const buttons = scope.querySelectorAll('button[data-apt-id][data-slot-text]');
             for (const btn of buttons) {
                 const dst = (btn.getAttribute('data-slot-text') || '').trim();
                 if (!dst.startsWith(prefix + ' -')) continue;
                 if (!dst.toUpperCase().endsWith(ampm)) continue;
                 btn.click();
-                return true;
+                return 'clicked';
             }
-            return false;
+            return 'missing';
         }
         """,
         {"prefix": prefix, "ampm": ampm},
     )
 
 
-async def poll_for_book_button(page, user_time: str, timeout_ms: int = 2500):
-    """
-    Tight-poll `find_book_button` until it returns a locator or the timeout
-    elapses. Much faster than wait_for_slots() + find_book_button() in
-    sequence: we catch the button within ~25 ms of it appearing and do no
-    redundant waits.
-    """
-    deadline = time.monotonic() + (timeout_ms / 1000.0)
-    while time.monotonic() < deadline:
-        btn = await find_book_button(page, user_time)
-        if btn:
-            return btn
-        await asyncio.sleep(0.025)
-    return None
-
-
-async def poll_and_js_click_book(page, user_time: str, timeout_ms: int = 2500) -> bool:
+async def poll_and_js_click_book(
+    page, user_time: str, timeout_ms: int = SLOT_LOAD_TIMEOUT_MS
+) -> str:
     """
     Tight-poll the page and, the moment the target BOOK NOW button exists,
     click it via JS in the same round trip. This is the fastest path: no
     Playwright click auto-waiting at all.
+
+    Stops as soon as the selected court's slots have loaded, so a court
+    without the time is skipped right away. `timeout_ms` only matters when
+    they're slow to load (slow Wi-Fi, or the site swamped at opening time).
+    Returns "clicked", "missing", or "timeout".
     """
     deadline = time.monotonic() + (timeout_ms / 1000.0)
     while time.monotonic() < deadline:
-        if await js_click_book_button(page, user_time):
-            return True
+        status = await js_click_book_button(page, user_time)
+        if status != "loading":
+            return status
         await asyncio.sleep(0.02)
-    return False
+    return "timeout"
 
 
 async def wait_for_slots(page, timeout: int = 8000):
@@ -932,60 +971,115 @@ async def get_court_tabs(page) -> list[str]:
         return []
 
 
+async def click_court_tab(page, label: str) -> bool:
+    """JS-click the court tab whose text is `label` (e.g. 'SCRC - 3').
+    Returns False if there's no such tab."""
+    return await page.evaluate(
+        """(label) => {
+            const tabs = document.querySelectorAll('[role=tab]');
+            for (const t of tabs) {
+                if ((t.innerText || '').trim() === label) {
+                    t.click();
+                    return true;
+                }
+            }
+            return false;
+        }""",
+        label,
+    )
+
+
 # ── Book: keep-alive loop ─────────────────────────────────────────────────────
 
 async def keep_alive(
     p, page, until: datetime, headless: bool, lead: float = 35.0, label: str = "Opens"
-):
+) -> bool:
     """
-    Reload the booking home page every ~2 minutes to prevent session timeout.
+    Reload the booking home page every KEEP_ALIVE_SECS to prevent session timeout.
     If the session dies anyway, auto-login again (Duo push) and keep waiting.
     Stops `lead` seconds before `until` (default 35 s, so the caller can pre-position).
     `label` names the event being waited for in the progress lines.
+
+    If the site can't be reached (Wi-Fi dropped, switched networks), retries
+    every OFFLINE_RETRY_SECS, and if it's still unreachable when the wait would
+    end, keeps retrying right up to `until`. Returns False if the site was
+    still unreachable then, True otherwise.
     """
+    offline = False
     while True:
         now = datetime.now(LA_TZ)
         remaining = (until - now).total_seconds()
 
-        if remaining <= lead:
-            break
+        if remaining <= (0 if offline else lead):
+            return not offline
 
-        sleep_secs = min(120.0, remaining - lead)
-        h = int(remaining // 3600)
-        m = int((remaining % 3600) // 60)
-        print(f"  [{now.strftime('%H:%M:%S')}] {label} in {h}h {m}m. "
-              f"Next keep-alive in {int(sleep_secs)}s...")
+        if offline:
+            sleep_secs = min(OFFLINE_RETRY_SECS, remaining)
+        else:
+            sleep_secs = min(KEEP_ALIVE_SECS, remaining - lead)
+            h = int(remaining // 3600)
+            m = int((remaining % 3600) // 60)
+            print(f"  [{now.strftime('%H:%M:%S')}] {label} in {h}h {m}m. "
+                  f"Next keep-alive in {int(sleep_secs)}s...")
         await asyncio.sleep(sleep_secs)
 
-        await page.goto(BOOKING_URL)
-        await page.wait_for_load_state("networkidle")
-
-        if not await check_logged_in(page):
-            print("  Session expired during wait — logging in again.")
-            try:
-                await relogin_context(p, page.context, headless)
-            except LoginError as e:
-                raise RuntimeError(f"Session expired during wait and re-login failed: {e}") from e
+        try:
             await page.goto(BOOKING_URL)
             await page.wait_for_load_state("networkidle")
+
             if not await check_logged_in(page):
-                raise RuntimeError("Re-login succeeded but the booking site still shows you signed out.")
+                print("  Session expired during wait. Logging in again.")
+                try:
+                    await relogin_context(p, page.context, headless)
+                except LoginError as e:
+                    raise RuntimeError(f"Session expired during wait and re-login failed: {e}") from e
+                await page.goto(BOOKING_URL)
+                await page.wait_for_load_state("networkidle")
+                if not await check_logged_in(page):
+                    raise RuntimeError("Re-login succeeded but the booking site still shows you signed out.")
+        except PlaywrightError as exc:
+            reason = network_error_reason(exc)
+            if reason is None:
+                raise
+            stamp = datetime.now(LA_TZ).strftime('%H:%M:%S')
+            if offline:
+                print(f"  [{stamp}] Still can't reach the UCLA site. "
+                      f"Retrying in {OFFLINE_RETRY_SECS}s...")
+            else:
+                print(f"  [{stamp}] Can't reach the UCLA site ({reason}). "
+                      f"Retrying every {OFFLINE_RETRY_SECS}s...")
+            offline = True
+            continue
+
+        if offline:
+            print(f"  [{datetime.now(LA_TZ).strftime('%H:%M:%S')}] Back online.")
+            offline = False
 
 
-async def verify_date_tab(page, sport: str, target_date: datetime):
+async def verify_date_tab(page, facility: str, target_date: datetime) -> bool:
     """Open the facility page and click the target date tab, retrying for up
     to TAB_VERIFY_TIMEOUT_SECS in case the site's midnight rollover lags.
-    Raises PlaywrightTimeout if the tab never shows up."""
+    Returns False if the site couldn't be reached to check. Raises
+    PlaywrightTimeout if the site loaded but the tab never showed up."""
     deadline = time.monotonic() + TAB_VERIFY_TIMEOUT_SECS
     while True:
-        await navigate_to_facility(page, sport)
+        try:
+            await navigate_to_facility(page, facility)
+        except PlaywrightError as exc:
+            if network_error_reason(exc) is None:
+                raise
+            if time.monotonic() >= deadline:
+                return False
+            print(f"  Can't reach the UCLA site. Retrying in {OFFLINE_RETRY_SECS}s...")
+            await asyncio.sleep(OFFLINE_RETRY_SECS)
+            continue
         try:
             await click_date_tab(page, target_date)
-            return
+            return True
         except PlaywrightTimeout:
             if time.monotonic() >= deadline:
                 raise
-            print("  Tab not there yet — retrying in 30s...")
+            print("  Tab not there yet. Retrying in 30s...")
             await asyncio.sleep(30)
 
 
@@ -993,6 +1087,7 @@ async def verify_date_tab(page, sport: str, target_date: datetime):
 
 async def cmd_book(
     sport: str | None,
+    where: str | None,
     date_str: str | None,
     time_str: str | None,
     court_str: str | None,
@@ -1001,7 +1096,8 @@ async def cmd_book(
 ):
     SCREENSHOTS_DIR.mkdir(exist_ok=True)
 
-    sport, date_str, time_str, court_pref = resolve_booking_args(sport, date_str, time_str, court_str)
+    facility, date_str, time_str, court_pref = resolve_booking_args(
+        sport, where, date_str, time_str, court_str)
 
     # Parse target datetime (LA time)
     target_date = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=LA_TZ)
@@ -1019,7 +1115,7 @@ async def cmd_book(
 
     label = "[DRY RUN] " if dry_run else ""
     print(f"\n=== UCLA Rec Booking Sniper {label}===")
-    print(f"Sport:         {sport}")
+    print(f"Where:         {FACILITY_CARD_NAMES[facility]}")
     if court_pref:
         print(f"Court:         {court_pref}")
     print(f"Target slot:   {target_dt.strftime('%a %Y-%m-%d %I:%M %p %Z')}")
@@ -1030,10 +1126,10 @@ async def cmd_book(
     day_name = target_date.strftime("%A")
     tab_pending = tab_time > now
     if open_time < now:
-        print("\nNote: Booking window is already open — attempting to book immediately.")
+        print("\nNote: Booking window is already open. Attempting to book immediately.")
     elif tab_pending:
-        print(f"\n{day_name} tab not available yet — waiting until "
-              f"{tab_time.strftime('%a %I:%M %p')} to load it. Keeping session alive until then.")
+        print(f"\n{day_name} tab not available yet. Waiting until "
+              f"{tab_time.strftime('%a %I:%M %p')} to load it, keeping the session alive until then.")
     else:
         secs = (open_time - now).total_seconds()
         print(f"\nBooking opens in {int(secs // 3600)}h {int((secs % 3600) // 60)}m. "
@@ -1043,33 +1139,55 @@ async def cmd_book(
         browser, context, page = await open_session(p, headless)
         print("\nSession valid.")
 
+        if not dry_run:
+            same_day = [b for b in await collect_upcoming_bookings(page)
+                        if b["facility"] == facility and b["date"] == date_str]
+            if same_day:
+                print(f"\nYou already have a booking at {FACILITY_CARD_NAMES[facility]} that day:")
+                for b in same_day:
+                    print(f"  {b['label']}")
+                print("UCLA allows one booking per day at each facility, so this one will fail "
+                      "unless you cancel that booking first.")
+                if not ask_yes_no("Keep going anyway?"):
+                    await browser.close()
+                    return
+
         if tab_pending:
             # Wait for the date tab to appear, then confirm it's really there
             # so a problem surfaces now rather than at open time.
-            await keep_alive(
+            online = await keep_alive(
                 p, page, tab_time + timedelta(seconds=TAB_APPEAR_GRACE_SECS), headless,
                 lead=0, label=f"{day_name} tab appears",
             )
-            print(f"\n{day_name} tab should be available now — checking...")
-            try:
-                await verify_date_tab(page, sport, target_date)
-            except PlaywrightTimeout as exc:
-                shot = SCREENSHOTS_DIR / f"tab_missing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                await page.screenshot(path=shot)
-                print(f"\nError: {day_name} tab never appeared: {exc}")
-                print(f"Screenshot saved: {shot}")
-                await browser.close()
-                sys.exit(1)
-            secs = (open_time - datetime.now(LA_TZ)).total_seconds()
-            print(f"{day_name} tab found. Booking opens in "
-                  f"{int(secs // 3600)}h {int((secs % 3600) // 60)}m — keeping session alive.")
+            if online:
+                print(f"\n{day_name} tab should be available now. Checking...")
+                try:
+                    online = await verify_date_tab(page, facility, target_date)
+                except PlaywrightTimeout as exc:
+                    shot = SCREENSHOTS_DIR / f"tab_missing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                    await page.screenshot(path=shot)
+                    print(f"\nError: {day_name} tab never appeared: {exc}")
+                    print(f"Screenshot saved: {shot}")
+                    await browser.close()
+                    sys.exit(1)
+            if online:
+                secs = (open_time - datetime.now(LA_TZ)).total_seconds()
+                print(f"{day_name} tab found. Booking opens in "
+                      f"{int(secs // 3600)}h {int((secs % 3600) // 60)}m. Keeping session alive.")
+            else:
+                print(f"\nCan't reach the UCLA site to check the {day_name} tab. "
+                      "Will keep trying until booking opens.")
 
         # Keep session alive until 35 s before the booking window opens
-        await keep_alive(p, page, open_time, headless)
+        if not await keep_alive(p, page, open_time, headless):
+            print(f"\nError: Still couldn't reach the UCLA site when booking opened "
+                  f"({open_time.strftime('%a %I:%M %p')}). Check your connection and try again.")
+            await browser.close()
+            sys.exit(1)
 
         # ── Navigate to facility ──────────────────────────────────────────────
         print("\nNavigating to facility page...")
-        await navigate_to_facility(page, sport)
+        await navigate_to_facility(page, facility)
 
         already_open = open_time <= datetime.now(LA_TZ)
         pre_date = target_date - timedelta(days=1)
@@ -1099,7 +1217,7 @@ async def cmd_book(
                 await asyncio.sleep(0.02)
 
         fire_ts = datetime.now(LA_TZ).strftime("%H:%M:%S.%f")
-        print(f"\n[{fire_ts}] Firing — clicking {format_date_tab(target_date)} tab...")
+        print(f"\n[{fire_ts}] Firing: clicking {format_date_tab(target_date)} tab...")
         t_fire = time.monotonic()
         try:
             # Skip networkidle on the critical click — we poll for BOOK NOW directly.
@@ -1138,27 +1256,14 @@ async def cmd_book(
             """
             if court_pref:
                 # Click the preferred court tab first, then poll for BOOK NOW.
-                ct_clicked = await page.evaluate(
-                    """(label) => {
-                        const tabs = document.querySelectorAll('[role=tab]');
-                        for (const t of tabs) {
-                            if ((t.innerText || '').trim() === label) {
-                                t.click();
-                                return true;
-                            }
-                        }
-                        return false;
-                    }""",
-                    court_pref,
-                )
-                if ct_clicked:
+                if await click_court_tab(page, court_pref):
                     t_poll_start = time.monotonic()
-                    ok = await poll_and_js_click_book(page, time_str, timeout_ms=2500)
+                    status = await poll_and_js_click_book(page, time_str)
                     t_poll_end = time.monotonic()
                     print(f"  [+{(t_poll_end - t_fire)*1000:6.0f} ms] "
                           f"poll {court_pref} "
-                          f"({'clicked' if ok else 'not found'} in {(t_poll_end - t_poll_start)*1000:.0f} ms)")
-                    if ok:
+                          f"({status} in {(t_poll_end - t_poll_start)*1000:.0f} ms)")
+                    if status == "clicked":
                         ts = datetime.now(LA_TZ).strftime("%H:%M:%S.%f")
                         print(f"[{ts}] Clicked BOOK NOW on {court_pref} ({attempt_label}) via JS")
                         await page.wait_for_load_state("networkidle")
@@ -1167,14 +1272,19 @@ async def cmd_book(
                     print(f"  Warning: could not click court tab '{court_pref}'")
                 return False
 
-            # No court preference — try current view, then cycle all courts.
+            # No court preference — try current view, then cycle the other courts.
+            current = await page.evaluate("""() => {
+                const tab = document.querySelector(
+                    '#tabBookingFacilities [role=tab][aria-selected=true]');
+                return tab ? tab.innerText.trim() : null;
+            }""")
             t_poll_start = time.monotonic()
-            ok = await poll_and_js_click_book(page, time_str, timeout_ms=6000)
+            status = await poll_and_js_click_book(page, time_str)
             t_poll_end = time.monotonic()
             print(f"  [+{(t_poll_end - t_fire)*1000:6.0f} ms] "
-                  f"poll_and_js_click_book "
-                  f"({'clicked' if ok else 'not found'} in {(t_poll_end - t_poll_start)*1000:.0f} ms)")
-            if ok:
+                  f"poll {current or 'current view'} "
+                  f"({status} in {(t_poll_end - t_poll_start)*1000:.0f} ms)")
+            if status == "clicked":
                 ts = datetime.now(LA_TZ).strftime("%H:%M:%S.%f")
                 print(f"[{ts}] Clicked BOOK NOW ({attempt_label}) via JS")
                 await page.wait_for_load_state("networkidle")
@@ -1182,24 +1292,17 @@ async def cmd_book(
 
             court_tabs = await get_court_tabs(page)
             for ct in court_tabs:
-                print(f"  Trying court tab: {ct}")
-                # JS-click the court tab too, for consistency + speed
-                ct_clicked = await page.evaluate(
-                    """(label) => {
-                        const tabs = document.querySelectorAll('[role=tab]');
-                        for (const t of tabs) {
-                            if ((t.innerText || '').trim() === label) {
-                                t.click();
-                                return true;
-                            }
-                        }
-                        return false;
-                    }""",
-                    ct,
-                )
-                if not ct_clicked:
+                if ct == current:
+                    continue  # already checked above
+                if not await click_court_tab(page, ct):
                     continue
-                if await poll_and_js_click_book(page, time_str, timeout_ms=800):
+                t_poll_start = time.monotonic()
+                status = await poll_and_js_click_book(page, time_str)
+                t_poll_end = time.monotonic()
+                print(f"  [+{(t_poll_end - t_fire)*1000:6.0f} ms] "
+                      f"poll {ct} "
+                      f"({status} in {(t_poll_end - t_poll_start)*1000:.0f} ms)")
+                if status == "clicked":
                     ts = datetime.now(LA_TZ).strftime("%H:%M:%S.%f")
                     print(f"[{ts}] Clicked BOOK NOW on {ct} ({attempt_label}) via JS")
                     await page.wait_for_load_state("networkidle")
@@ -1208,12 +1311,12 @@ async def cmd_book(
 
         for attempt in range(1, max_retries + 1):
             booked = await try_book_on_current_view(f"attempt {attempt}")
-            if booked:
+            if booked or attempt == max_retries:
                 break
 
             print(f"Attempt {attempt}: BOOK NOW not found for '{time_str}'. Re-navigating...")
             # Re-navigate cleanly to the facility page to avoid stale/wrong page state
-            await navigate_to_facility(page, sport)
+            await navigate_to_facility(page, facility)
             await click_date_tab(page, target_date, wait_networkidle=False)
 
         if not booked:
@@ -1225,19 +1328,10 @@ async def cmd_book(
             sys.exit(1)
 
         # ── Confirmation ──────────────────────────────────────────────────────
-        # Navigate back to the bookings home so the screenshot shows the
-        # Upcoming list with the new reservation, like the cancel confirmation.
-        try:
-            await page.goto(BOOKING_URL)
-            await page.wait_for_load_state("networkidle")
-            # Scroll down so the Upcoming section is in frame
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await asyncio.sleep(0.4)
-        except Exception:
-            pass  # Fall through and screenshot whatever state we're in
-        shot = SCREENSHOTS_DIR / f"booking_confirmation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-        await page.screenshot(path=shot, full_page=True)
-        print(f"\nBooking complete! Confirmation screenshot: {shot}")
+        print("\nBooking complete! Saving confirmation screenshot...")
+
+        shot = await save_bookings_screenshot(page, "booking_confirmation")
+        print(f"Confirmation screenshot: {shot}")
 
         if not headless:
             print("Browser stays open for 30 s. Press Ctrl+C to close early.")
@@ -1248,11 +1342,13 @@ async def cmd_book(
 
 # ── Inspect command ──────────────────────────────────────────────────────────
 
-async def cmd_inspect(sport: str | None, date_str: str | None, headless: bool = True):
+async def cmd_inspect(
+    sport: str | None, where: str | None, date_str: str | None, headless: bool = True
+):
     """Navigate to a facility page and dump its structure — helps find
     faster selectors for tabs, time slot rows, and BOOK NOW buttons."""
     SCREENSHOTS_DIR.mkdir(exist_ok=True)
-    sport = resolve_sport(sport)
+    facility = resolve_facility(resolve_sport(sport), where)
 
     # Only use a date if one was explicitly provided. Unlike `list`/`book`,
     # inspect does not prompt — omitting --date inspects the default (today's) tab.
@@ -1268,8 +1364,8 @@ async def cmd_inspect(sport: str | None, date_str: str | None, headless: bool = 
     async with async_playwright() as p:
         browser, context, page = await open_session(p, headless)
 
-        print(f"Navigating to {sport} facility page...")
-        await navigate_to_facility(page, sport)
+        print(f"Navigating to {FACILITY_CARD_NAMES[facility]}...")
+        await navigate_to_facility(page, facility)
 
         if target_date is not None:
             try:
@@ -1346,31 +1442,32 @@ async def cmd_inspect(sport: str | None, date_str: str | None, headless: bool = 
             }
         """)
 
-        print(f"── {len(dump['tabs'])} [role=tab] elements ──")
+        print(f"-- {len(dump['tabs'])} [role=tab] elements --")
         for t in dump["tabs"]:
             print(f"  <{t['tag'].lower()} class='{t['cls']}' id='{t['id']}'>"
                   f"  text={t['text']!r}")
 
-        print(f"\n── {len(dump['bookButtons'])} 'Book Now' elements ──")
+        print(f"\n-- {len(dump['bookButtons'])} 'Book Now' elements --")
         for b in dump["bookButtons"][:10]:
             keys = [k for k in b["attrs"] if k not in ("class", "id")]
             extra = " ".join(f"{k}={b['attrs'][k]!r}" for k in keys[:4])
             print(f"  <{b['tag'].lower()} class='{b['cls']}' {extra}>")
 
-        print("\n── ancestors of first Book Now ──")
+        print("\n-- ancestors of first Book Now --")
         for n in dump["rowChain"]:
             print(f"  depth={n['depth']} <{n['tag'].lower()} "
                   f"class='{(n['cls'] or '')[:40]}' role={n['role']!r}>")
             print(f"    text={n['text']!r}")
 
-        print(f"\n── {len(dump['slotTexts'])} slot-row text samples ──")
+        print(f"\n-- {len(dump['slotTexts'])} slot-row text samples --")
         for s in dump["slotTexts"][:10]:
             print(f"  {s!r}")
 
-        shot = SCREENSHOTS_DIR / f"inspect_{sport}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        shot = SCREENSHOTS_DIR / f"inspect_{facility}_{stamp}.png"
         await page.screenshot(path=shot, full_page=True)
-        html_path = SCREENSHOTS_DIR / f"inspect_{sport}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
-        html_path.write_text(await page.content())
+        html_path = SCREENSHOTS_DIR / f"inspect_{facility}_{stamp}.html"
+        html_path.write_text(await page.content(), encoding="utf-8")
         print(f"\nFull-page screenshot: {shot}")
         print(f"Full HTML dump:       {html_path}")
 
@@ -1386,7 +1483,7 @@ async def extract_slots(page) -> list[dict]:
 
     `status` is derived from spot availability (not button state):
       - 'available'    — spot_count > 0 (even if BOOK NOW is absent due to
-                         the one-booking-per-sport-per-day rule)
+                         the one-booking-per-day rule)
       - 'full'         — 0 spots available
       - 'not yet open' — booking window hasn't opened yet
     """
@@ -1428,41 +1525,25 @@ async def extract_slots(page) -> list[dict]:
     )
 
 
-async def click_court_tab(page, label: str) -> bool:
-    return await page.evaluate(
-        """(label) => {
-            const tabs = document.querySelectorAll('[role=tab]');
-            for (const t of tabs) {
-                if ((t.innerText || '').trim() === label) {
-                    t.click();
-                    return true;
-                }
-            }
-            return false;
-        }""",
-        label,
-    )
-
-
-async def cmd_list(sport: str | None, date_str: str | None, headless: bool):
+async def cmd_list(sport: str | None, where: str | None, date_str: str | None, headless: bool):
     SCREENSHOTS_DIR.mkdir(exist_ok=True)
-    sport = resolve_sport(sport)
+    facility = resolve_facility(resolve_sport(sport), where)
     date_str = resolve_date(date_str, check=check_tab_visible)
     target_date = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=LA_TZ)
 
     async with async_playwright() as p:
         browser, context, page = await open_session(p, headless)
 
-        # Collect user's upcoming bookings from the home page so we can mark
-        # slots the user has already booked in the listing below.
-        all_user_bookings = await get_user_bookings_structured(page)
+        # Collect the user's upcoming bookings so we can mark slots they've
+        # already booked in the listing below.
+        all_user_bookings = await collect_upcoming_bookings(page)
         user_bookings_here = [
             b for b in all_user_bookings
-            if b["sport"] == sport and b["date"] == date_str
+            if b["facility"] == facility and b["date"] == date_str
         ]
 
-        print(f"\nNavigating to {sport} facility page...")
-        await navigate_to_facility(page, sport)
+        print(f"\nNavigating to {FACILITY_CARD_NAMES[facility]}...")
+        await navigate_to_facility(page, facility)
 
         # The site defaults to today's tab, so skip the click for today.
         today = datetime.now(LA_TZ).date()
@@ -1474,7 +1555,7 @@ async def cmd_list(sport: str | None, date_str: str | None, headless: bool):
                 await browser.close()
                 sys.exit(1)
 
-        header = f"=== {FACILITY_CARD_NAMES[sport]} — {target_date.strftime('%a, %b %d %Y').replace(' 0', ' ')} ==="
+        header = f"=== {FACILITY_CARD_NAMES[facility]} | {target_date.strftime('%a, %b %d %Y').replace(' 0', ' ')} ==="
         print(f"\n{header}")
 
         court_tabs = await get_court_tabs(page)
@@ -1502,8 +1583,7 @@ def _print_slots_pickleball(slots: list[dict], user_bookings: list[dict]) -> Non
         return
 
     if user_bookings:
-        print("  (You already have a booking for pickleball on this day"
-              " — new bookings will be rejected.)\n")
+        print("  (You already have a booking here that day, so new bookings will be rejected.)\n")
 
     booked_starts = {b["start_minute"] for b in user_bookings}
     your_bookings, available, full, not_yet_open = [], [], [], []
@@ -1554,8 +1634,7 @@ def _print_slots_tennis(
         return
 
     if user_bookings:
-        print("  (You already have a booking for tennis on this day"
-              " — new bookings will be rejected.)\n")
+        print("  (You already have a booking here that day, so new bookings will be rejected.)\n")
 
     user_court_by_start: dict[int, str] = {}
     for b in user_bookings:
@@ -1629,190 +1708,126 @@ def _print_slots_tennis(
             print(f"    {label}  ({n} {word}: {', '.join(courts)})")
 
 
-# ── Cancel command ───────────────────────────────────────────────────────────
+# ── Your bookings (status, cancel, list, book) ───────────────────────────────
 
-def parse_booking_label(raw: str) -> str:
+def parse_booking_card(raw: str) -> dict:
+    """Parse a row of the bookings page, for example
+      'SCRC Tennis Courts - SCRC - 2 Tue, Apr 14 2026 12:00 - 12:50 PM CANCEL'
+    into
+      {"facility": "tennis", "court": "SCRC - 2", "date": "2026-04-14", "start_minute": 720,
+       "label": "SCRC Tennis Courts (SCRC - 2)  |  Tue, Apr 14 2026  |  12:00 - 12:50 PM"}
+
+    "facility" is the FACILITY_CARD_NAMES key (None for others, like squash),
+    and "court" is None for pickleball (its bookings all say 'SCRC - 1').
+    Fields that can't be parsed are None, and the label falls back to the raw text.
     """
-    Extract court name, date, and time from a raw booking card innerText.
-    Input example:
-      'SCRC Tennis Courts - SCRC - 2 more_vert Open booking actions dropdown
-       person NICHOLAS CHEN today Tue, Apr 14 2026 schedule 12:00 - 12:50 PM'
-    Output: 'SCRC Tennis Courts  |  Tue, Apr 14 2026  |  12:00 - 12:50 PM'
-    """
-    facility_m = re.match(r'^([\w\s]+Courts)', raw)
-    facility = facility_m.group(1).strip() if facility_m else ""
+    facility = next((key for key, name in FACILITY_CARD_NAMES.items() if raw.startswith(name)), None)
 
-    date_m = re.search(r'today\s+(\w{3},\s+\w{3}\s+\d{1,2}\s+\d{4})', raw)
-    date_s = date_m.group(1) if date_m else ""
+    name = court = None
+    m = re.match(r"(.+?Courts)(?:\s*-\s*([A-Z]+\s*-\s*\d+))?", raw)
+    if m:
+        name = m.group(1).strip()
+        court = m.group(2) if facility != "pickleball" else None
 
-    time_m = re.search(r'(\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}\s*(?:AM|PM))', raw)
-    time_s = time_m.group(1).strip() if time_m else ""
-
-    parts = [x for x in [facility, date_s, time_s] if x]
-    return "  |  ".join(parts) if parts else raw[:80]
-
-
-def parse_booking_info(raw: str) -> dict | None:
-    """Parse raw booking card text into structured fields, or None on failure.
-
-    Returns: {"sport", "court" (None for pickleball), "date" (YYYY-MM-DD), "start_minute"}.
-    """
-    if "Tennis Courts" in raw:
-        sport = "tennis"
-    elif "Pickleball Courts" in raw:
-        sport = "pickleball"
-    else:
-        return None
-
-    court = None
-    if sport == "tennis":
-        m = re.search(r"Tennis Courts\s*-\s*(SCRC\s*-\s*\d+)", raw)
-        if m:
-            court = m.group(1).strip()
-
-    date_iso = None
-    date_m = re.search(r"\w{3},\s+(\w{3})\s+(\d{1,2})\s+(\d{4})", raw)
-    if date_m:
+    date_text = date_iso = None
+    m = re.search(r"\w{3},\s+(\w{3})\s+(\d{1,2})\s+(\d{4})", raw)
+    if m:
+        date_text = m.group(0)
         try:
-            dt = datetime.strptime(
-                f"{date_m.group(1)} {date_m.group(2)} {date_m.group(3)}", "%b %d %Y"
-            )
-            date_iso = dt.strftime("%Y-%m-%d")
+            date_iso = datetime.strptime(" ".join(m.groups()), "%b %d %Y").strftime("%Y-%m-%d")
         except ValueError:
             pass
 
-    start_minute = None
-    time_label = None
-    time_m = re.search(r"(\d{1,2}):(\d{2})\s*-\s*\d{1,2}:\d{2}\s*(AM|PM)", raw)
-    if time_m:
-        hour = int(time_m.group(1))
-        minute = int(time_m.group(2))
-        ampm = time_m.group(3)
-        if ampm == "PM" and hour != 12:
-            hour += 12
-        elif ampm == "AM" and hour == 12:
-            hour = 0
-        start_minute = hour * 60 + minute
-        time_label = time_m.group(0)
+    m = re.search(r"\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}\s*(?:AM|PM)", raw)
+    time_label = m.group(0) if m else None
+    start_minute = parse_slot_start_minute(time_label) if time_label else None
 
-    if date_iso is None or start_minute is None:
-        return None
-
+    if name and court:
+        name = f"{name} ({court})"
+    parts = [x for x in (name, date_text, time_label) if x]
     return {
-        "sport": sport,
+        "facility": facility,
         "court": court,
         "date": date_iso,
         "start_minute": start_minute,
-        "time_label": time_label,
+        "label": "  |  ".join(parts) if parts else raw[:80],
     }
 
 
-async def get_user_bookings_structured(page) -> list[dict]:
-    """Return a list of the user's upcoming bookings as structured records.
+def booking_start(booking: dict) -> datetime | None:
+    """When a parsed booking starts (Pacific time), or None if it didn't parse."""
+    if booking["date"] is None or booking["start_minute"] is None:
+        return None
+    day = datetime.strptime(booking["date"], "%Y-%m-%d").replace(tzinfo=LA_TZ)
+    return day + timedelta(minutes=booking["start_minute"])
 
-    Must be called while `page` is on the booking home (BOOKING_URL).
+
+async def save_bookings_screenshot(page, prefix: str) -> Path:
     """
-    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    await asyncio.sleep(0.4)
+    Screenshot the full bookings list at BOOKINGS_URL and return the file path.
 
-    action_btns = page.locator("button").filter(
-        has_text=re.compile(r"Open booking actions dropdown", re.IGNORECASE)
-    )
-    count = await action_btns.count()
-
-    bookings: list[dict] = []
-    seen: set[tuple] = set()
-    for i in range(count):
-        btn = action_btns.nth(i)
-        raw = await btn.evaluate("""
-            el => {
-                let card = el;
-                for (let depth = 0; depth < 10; depth++) {
-                    card = card.parentElement;
-                    if (!card) return '';
-                    const text = (card.innerText || '').trim();
-                    if (text.match(/\\d{4}/) && text.match(/\\d{1,2}:\\d{2}/)) {
-                        return text.replace(/\\s+/g, ' ');
-                    }
-                }
-                return '';
-            }
-        """)
-        info = parse_booking_info(raw or "")
-        if not info:
-            continue
-        key = (info["sport"], info["court"], info["date"], info["start_minute"])
-        if key in seen:
-            continue
-        seen.add(key)
-        bookings.append(info)
-
-    return bookings
-
-
-async def collect_upcoming_bookings(page):
+    The list is sorted by date, not booking order, so the booking of interest
+    can be in any row. The window is grown to the page's full height so the
+    cookie notice, which is pinned to the bottom of the window, lands on the
+    footer instead of covering rows. (A full_page screenshot alone doesn't do
+    this: pinned elements stay at the current scroll spot.)
     """
-    Return a list of dicts, one per upcoming booking:
-      {
-        "label":          str,      # cleaned court / date / time summary
-        "action_btn":     Locator,  # the '⋮' dropdown button on that card
-        "participant_id": str|None, # data-booking-participant-id from the card
-      }
+    try:
+        await page.goto(BOOKINGS_URL)
+        await page.wait_for_load_state("networkidle")
+        height = await page.evaluate("document.documentElement.scrollHeight")
+        await page.set_viewport_size({"width": 1280, "height": height})
+        await asyncio.sleep(1)  # let the page settle before the screenshot
+    except Exception:
+        pass  # Fall through and screenshot whatever state we're in
+    shot = SCREENSHOTS_DIR / f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+    await page.screenshot(path=shot, full_page=True)
+    return shot
 
-    Anchors on the action-dropdown button (one per card) to avoid duplicates
-    from parent/child elements matching the same text heuristic. Also extracts
-    the participant-id from the card's (hidden) cancel-booking anchor so we can
-    uniquely target that link later without relying on visible-first ordering.
+
+async def collect_upcoming_bookings(page) -> list[dict]:
     """
-    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    await asyncio.sleep(0.4)
+    Return the user's upcoming bookings from BOOKINGS_URL, soonest first, one
+    dict per booking: parse_booking_card's fields plus "participant_id", the
+    booking's id from its Cancel button (None if it has no Cancel button).
 
-    # Each booking card has a three-dots button whose inner text (from a hidden
-    # accessibility span) reads "Open booking actions dropdown".
-    action_btns = page.locator("button").filter(
-        has_text=re.compile(r"Open booking actions dropdown", re.IGNORECASE)
-    )
-    count = await action_btns.count()
+    That page lists every booking, newest first and 10 to a page, so the
+    upcoming ones are all on the first page. (The booking home page only
+    shows 3.)
+    """
+    await page.goto(BOOKINGS_URL)
+    for attempt in range(2):
+        await page.wait_for_load_state("networkidle")
+        try:
+            rows = await page.evaluate("""() =>
+                [...document.querySelectorAll('#grdCourtBookings tbody tr')].map(tr => {
+                    const btn = tr.querySelector('button.btn-cancel-grid');
+                    return {
+                        text: tr.innerText,
+                        id: btn ? btn.getAttribute('data-booking-participant-id') : null,
+                    };
+                })""")
+            break
+        except PlaywrightError:
+            # Loading this page posts back to the server and reloads it once.
+            # If the read landed during that reload, read again.
+            if attempt:
+                raise
 
+    now = datetime.now(LA_TZ)
     bookings = []
-    seen_labels: set[str] = set()
-    for i in range(count):
-        btn = action_btns.nth(i)
-        info = await btn.evaluate("""
-            el => {
-                let card = el;
-                for (let depth = 0; depth < 10; depth++) {
-                    card = card.parentElement;
-                    if (!card) return { text: '', participantId: null };
-                    const text = (card.innerText || '').trim();
-                    if (text.match(/\\d{4}/) && text.match(/\\d{1,2}:\\d{2}/)) {
-                        const link = card.querySelector('a.cancel-booking-btn');
-                        return {
-                            text: text.replace(/\\s+/g, ' '),
-                            participantId: link ? link.getAttribute('data-booking-participant-id') : null,
-                        };
-                    }
-                }
-                return { text: '', participantId: null };
-            }
-        """)
-        label = parse_booking_label(info.get("text", ""))
-        if label in seen_labels:
-            continue  # skip duplicate card from nested DOM match
-        seen_labels.add(label)
-        bookings.append({
-            "label": label,
-            "action_btn": btn,
-            "participant_id": info.get("participantId"),
-        })
+    for row in rows:
+        booking = parse_booking_card(" ".join(row["text"].split()))
+        start = booking_start(booking)
+        # A row that didn't parse counts as upcoming if it can still be cancelled.
+        if not (start > now if start else row["id"]):
+            continue
+        booking["participant_id"] = row["id"]
+        bookings.append(booking)
 
+    # Soonest first; rows that didn't parse go last.
+    bookings.sort(key=lambda b: (b["date"] or "9999", b["start_minute"] or 0))
     return bookings
-
-
-async def reveal_cancel_option(action_btn):
-    """Click the action-dropdown button on a booking card."""
-    await action_btn.scroll_into_view_if_needed(timeout=3000)
-    await action_btn.click()
 
 
 async def cmd_status(headless: bool = True):
@@ -1820,24 +1835,16 @@ async def cmd_status(headless: bool = True):
     async with async_playwright() as p:
         browser, context, page = await open_session(p, headless)
 
-        bookings = await get_user_bookings_structured(page)
+        bookings = await collect_upcoming_bookings(page)
         await browser.close()
 
     if not bookings:
         print("\nNo upcoming bookings.")
         return
 
-    # Sort by date, then start time
-    bookings.sort(key=lambda b: (b["date"], b["start_minute"]))
-
     print(f"\n=== Your upcoming bookings ({len(bookings)}) ===")
     for b in bookings:
-        facility = FACILITY_CARD_NAMES.get(b["sport"], b["sport"].title())
-        court = f" ({b['court']})" if b.get("court") else ""
-        date_obj = datetime.strptime(b["date"], "%Y-%m-%d")
-        date_display = date_obj.strftime("%a, %b %d %Y").replace(" 0", " ")
-        time_display = b.get("time_label") or ""
-        print(f"  {facility}{court}  |  {date_display}  |  {time_display}")
+        print(f"  {b['label']}")
 
 
 async def cmd_cancel(headless: bool = False):
@@ -1846,7 +1853,7 @@ async def cmd_cancel(headless: bool = False):
         browser, context, page = await open_session(p, headless)
 
         # ── Find bookings ─────────────────────────────────────────────────────
-        bookings = await collect_upcoming_bookings(page)
+        bookings = [b for b in await collect_upcoming_bookings(page) if b["participant_id"]]
 
         if not bookings:
             print("No upcoming bookings found.")
@@ -1858,69 +1865,50 @@ async def cmd_cancel(headless: bool = False):
             print(f"  [{i}] {b['label']}")
 
         print()
-        raw = input("Enter the number of the booking to cancel (or 'q' to quit): ").strip()
-        if raw.lower() == "q":
+
+        def pick(raw: str) -> int | None:
+            if raw.lower() == "q":
+                return None
+            if raw.isdigit() and 1 <= int(raw) <= len(bookings):
+                return int(raw)
+            raise ValueError(f"Enter a number from 1 to {len(bookings)}, or q to quit.")
+
+        choice = prompt_until_valid("Enter the number of the booking to cancel (or 'q' to quit)", pick)
+        if choice is None:
             await browser.close()
             return
-
-        try:
-            choice = int(raw)
-            if not (1 <= choice <= len(bookings)):
-                raise ValueError
-        except ValueError:
-            print(f"Invalid choice '{raw}'. Exiting.")
-            await browser.close()
-            sys.exit(1)
 
         selected = bookings[choice - 1]
         print(f"\nCancelling: {selected['label']}")
 
-        # ── Open the action menu ──────────────────────────────────────────────
-        await reveal_cancel_option(selected["action_btn"])
-        await asyncio.sleep(0.3)
+        # ── Confirm in the cancel dialog ──────────────────────────────────────
+        # The row's Cancel button copies the booking's id into the dialog, and
+        # "Yes, Cancel" cancels whichever id the dialog holds, so check it first.
+        pid = selected["participant_id"]
+        await page.locator(f'button.btn-cancel-grid[data-booking-participant-id="{pid}"]').click()
+        dialog = page.locator("#modalCancelBooking")
+        await dialog.wait_for(state="visible", timeout=5000)
+        if await page.locator("#hdnBookingParticipantId").input_value() != pid:
+            print("Error: The cancel dialog opened for a different booking, so nothing was cancelled.")
+            await browser.close()
+            sys.exit(1)
+        await page.locator("#btnCancelBooking").click()
 
-        # Every booking card has its own (initially hidden) cancel-booking-btn
-        # anchor. Target the exact one for this card by its unique
-        # data-booking-participant-id — otherwise `.first` picks a hidden link
-        # from some other card. Fall back to `:visible` if the id is missing.
-        pid = selected.get("participant_id")
-        if pid:
-            # The site renders the dropdown twice (mobile + desktop variants),
-            # so the participant-id selector matches two identical anchors.
-            # Pick the visible one; if Playwright still sees both as visible,
-            # `.first` is a safe tiebreaker since they point at the same booking.
-            cancel_link = page.locator(
-                f'a.cancel-booking-btn[data-booking-participant-id="{pid}"]:visible'
-            ).first
-        else:
-            cancel_link = page.locator("a.cancel-booking-btn:visible").first
-
-        await cancel_link.wait_for(state="visible", timeout=5000)
-        await cancel_link.click()
-        await page.wait_for_load_state("networkidle")
-
-        # ── Confirm cancellation modal ────────────────────────────────────────
-        # Modal has "BACK" and "YES, CANCEL" buttons (screenshots 12-13)
-        confirm_btn = page.get_by_role("button", name="YES, CANCEL").or_(
-            page.get_by_text("YES, CANCEL", exact=False)
-        ).first
-        await confirm_btn.wait_for(state="visible", timeout=5000)
-        await confirm_btn.click()
-
-        # Wait for the cancel modal to disappear — this is a reliable signal that
-        # the server has processed the cancellation (more robust than networkidle
-        # alone, which can resolve before the POST completes in headless mode).
         try:
-            await page.locator("#modalCancelBooking-title").wait_for(
-                state="hidden", timeout=10000
-            )
+            await dialog.wait_for(state="hidden", timeout=10000)
         except PlaywrightTimeout:
             pass
         await page.wait_for_load_state("networkidle")
-        await asyncio.sleep(2)  # brief pause to let the page settle in all modes
 
-        shot = SCREENSHOTS_DIR / f"cancel_confirmation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-        await page.screenshot(path=shot)
+        shot = await save_bookings_screenshot(page, "cancel_confirmation")
+
+        # Make sure it's really gone before saying so.
+        still_there = any(b["participant_id"] == pid for b in await collect_upcoming_bookings(page))
+        if still_there:
+            print(f"Error: The booking still shows on the bookings page. Check the website. "
+                  f"Screenshot saved: {shot}")
+            await browser.close()
+            sys.exit(1)
         print(f"Booking cancelled. Screenshot saved: {shot}")
 
         if not headless:
@@ -1930,24 +1918,86 @@ async def cmd_cancel(headless: bool = False):
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+def run(coro) -> None:
+    """Run a command's coroutine. Timeouts and Ctrl+C print a short message
+    and exit instead of dumping a traceback."""
+    try:
+        asyncio.run(coro)
+    except PlaywrightTimeout as exc:
+        detail = str(exc).splitlines()[0] if str(exc) else ""
+        m = re.search(r"Timeout (\d+)ms exceeded", detail)
+        if m:
+            # Usually a slow or dropped connection.
+            print(f"\nError: Timed out after {int(m.group(1)) // 1000} seconds waiting for "
+                  "the UCLA site. Check your network connection and try again.")
+        else:
+            # One of our own timeouts, e.g. "Could not find date tab ...".
+            print(f"\nError: {detail}")
+        sys.exit(1)
+    except PlaywrightError as exc:
+        reason = network_error_reason(exc)
+        if reason is None:
+            raise
+        print(f"\nError: Lost the connection to the UCLA site ({reason}). "
+              "Check your network connection and try again.")
+        sys.exit(1)
+    except (KeyboardInterrupt, EOFError):
+        print("\nStopped.")
+        sys.exit(130)
+
+
+def run_menu() -> None:
+    """No command given: pick one from a menu, run it, then show the menu again."""
+    items = [
+        ("Book a court", lambda: cmd_book(None, None, None, None, None, headless=True, dry_run=False)),
+        ("See what's open", lambda: cmd_list(None, None, None, headless=True)),
+        ("See your bookings", lambda: cmd_status(headless=True)),
+        ("Cancel a booking", lambda: cmd_cancel(headless=True)),
+    ]
+    while True:
+        print("\n=== UCLA Rec booking bot ===")
+        for i, (label, _) in enumerate(items, 1):
+            print(f"  {i}. {label}")
+        print("  q. Quit")
+        try:
+            choice = input(f"Choose 1-{len(items)} or q: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return
+        if choice == "q":
+            return
+        if not (choice.isdigit() and 1 <= int(choice) <= len(items)):
+            print(f"  '{choice}' isn't an option.")
+            continue
+        try:
+            run(items[int(choice) - 1][1]())
+        except SystemExit:
+            pass  # the command already said why it stopped
+        except Exception:
+            traceback.print_exc()  # keep the menu (and its window) open
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="UCLA Rec booking sniper — fires at the exact moment a reservation opens",
+        description="UCLA Rec booking sniper: books a court the moment its reservation opens. "
+                    "Run with no command for a menu.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-examples:
-  uv run bookingbot.py login
-  uv run bookingbot.py list                               # interactive sport/date
-  uv run bookingbot.py l pb tmr                           # positional + aliases
-  uv run bookingbot.py list --sport tennis --date saturday
-  uv run bookingbot.py book                               # fully interactive
-  uv run bookingbot.py b t sat 10 3                       # tennis, Sat 10 AM, court 3
-  uv run bookingbot.py book --sport pickleball --date saturday --time 10AM
-  uv run bookingbot.py book --sport tennis --date +3 --time 2PM --headed
-  uv run bookingbot.py book --sport pickleball --date tomorrow --time "10:30 AM" --dry-run
+examples (with uv, run 'uv run bookingbot.py' instead of 'python bookingbot.py'):
+  python bookingbot.py                                  # menu
+  python bookingbot.py login
+  python bookingbot.py list                             # interactive sport/date
+  python bookingbot.py l pb tmr                         # positional + aliases
+  python bookingbot.py list --sport tennis --date saturday
+  python bookingbot.py book                             # fully interactive
+  python bookingbot.py b t sat 10 3                     # tennis, Sat 10 AM, court 3
+  python bookingbot.py b t sy sat 10 3                  # same, at Sycamore
+  python bookingbot.py book --sport pickleball --date saturday --time 10AM
+  python bookingbot.py book --sport tennis --date +3 --time 2PM --headed
+  python bookingbot.py book --sport pickleball --date tomorrow --time "10 AM"
         """,
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command")
 
     login_p = subparsers.add_parser(
         "login",
@@ -1962,26 +2012,32 @@ examples:
         help="Run the automated login in a visible browser (default: headless)",
     )
 
-    # Shared help text for the sport/date/time/court arguments.
+    # Shared help text for the sport/where/date/time/court arguments.
     sport_help = "Sport: tennis (t, ten) or pickleball (p, pb, pickle)"
+    where_help = ("Where to play tennis: scrc (sc, sunset) or sycamore (sy, syc). "
+                  "Can be left out, which means SCRC")
     date_help = ("Date: YYYY-MM-DD, today, tomorrow (tmr), weekday (sat, sa), "
                  "or +N days")
-    time_help = ("Start time: 10, 2, 10:30, 2PM, '10:30 AM' "
+    time_help = ("Start time: 10, 2, 2PM, '10 AM' "
                  "(AM/PM optional: 8-11 = AM, 12-7 = PM)")
-    court_help = "Tennis court number (2-6) or 'any'. Ignored for pickleball."
+    court_help = "Tennis court number (2-6 at SCRC, 1-6 at Sycamore) or 'any'. Ignored for pickleball."
 
     book_p = subparsers.add_parser(
         "book", aliases=["b"],
         help="Wait for the booking window to open and snipe the target slot",
-        description="Positional form: book [SPORT] [DATE] [TIME] [COURT], "
-                    "e.g. 'book t sat 10 3'. Anything omitted is prompted for.",
+        description="Positional form: book [SPORT] [WHERE] [DATE] [TIME] [COURT], "
+                    "e.g. 'book t sat 10 3' or 'book t sy sat 10 3'. WHERE is only for "
+                    "tennis and can be left out (SCRC). Anything omitted at the end is "
+                    "prompted for.",
     )
     book_p.set_defaults(command="book")
     book_p.add_argument("sport_pos", nargs="?", metavar="SPORT", help=sport_help)
+    book_p.add_argument("where_pos", nargs="?", metavar="WHERE", help=where_help)
     book_p.add_argument("date_pos", nargs="?", metavar="DATE", help=date_help)
     book_p.add_argument("time_pos", nargs="?", metavar="TIME", help=time_help)
     book_p.add_argument("court_pos", nargs="?", metavar="COURT", help=court_help)
     book_p.add_argument("--sport", help=f"{sport_help} (prompted if omitted)")
+    book_p.add_argument("--where", metavar="WHERE", help=where_help)
     book_p.add_argument("--date", metavar="DATE", help=f"{date_help} (prompted if omitted)")
     book_p.add_argument("--time", metavar="TIME", help=f"{time_help} (prompted if omitted)")
     book_p.add_argument(
@@ -1994,18 +2050,21 @@ examples:
     )
     book_p.add_argument(
         "--dry-run", action="store_true",
-        help="Navigate and verify the slot is visible, but do not click BOOK NOW",
+        help="Go through the booking but stop before clicking BOOK NOW, and save a screenshot",
     )
 
     list_p = subparsers.add_parser(
         "list", aliases=["l"],
         help="List all time slots on a facility page for a given date",
-        description="Positional form: list [SPORT] [DATE], e.g. 'list pb tmr'.",
+        description="Positional form: list [SPORT] [WHERE] [DATE], e.g. 'list pb tmr' "
+                    "or 'list t sy tmr'.",
     )
     list_p.set_defaults(command="list")
     list_p.add_argument("sport_pos", nargs="?", metavar="SPORT", help=sport_help)
+    list_p.add_argument("where_pos", nargs="?", metavar="WHERE", help=where_help)
     list_p.add_argument("date_pos", nargs="?", metavar="DATE", help=date_help)
     list_p.add_argument("--sport", help=f"{sport_help} (prompted if omitted)")
+    list_p.add_argument("--where", metavar="WHERE", help=where_help)
     list_p.add_argument("--date", metavar="DATE", help=f"{date_help} (prompted if omitted)")
     list_p.add_argument(
         "--headed", action="store_true",
@@ -2035,13 +2094,15 @@ examples:
     inspect_p = subparsers.add_parser(
         "inspect",
         help="Dump the DOM structure of a facility page (for developing selectors)",
-        description="Positional form: inspect [SPORT] [DATE].",
+        description="Positional form: inspect [SPORT] [WHERE] [DATE].",
     )
     inspect_p.add_argument("sport_pos", nargs="?", metavar="SPORT", help=sport_help)
+    inspect_p.add_argument("where_pos", nargs="?", metavar="WHERE", help=where_help)
     inspect_p.add_argument("date_pos", nargs="?", metavar="DATE", help=date_help)
     inspect_p.add_argument(
         "--sport", help=f"{sport_help} (prompted if omitted)",
     )
+    inspect_p.add_argument("--where", metavar="WHERE", help=where_help)
     inspect_p.add_argument(
         "--date", metavar="DATE",
         help=f"Optional date to click before dumping. {date_help}. If omitted, "
@@ -2053,9 +2114,23 @@ examples:
     )
 
     args = parser.parse_args()
+    if args.command is None:
+        run_menu()
+        return
+
+    # WHERE is optional, so if the word in its spot isn't a place, it's really
+    # the date: shift it and the answers after it over by one.
+    later = {"book": ["date_pos", "time_pos", "court_pos"],
+             "list": ["date_pos"], "inspect": ["date_pos"]}.get(args.command)
+    if later and args.where_pos is not None and args.where_pos.strip().lower() not in WHERE_ALIASES:
+        if getattr(args, later[-1]) is not None:
+            parser.error("too many answers")
+        for name, value in zip(later, [args.where_pos] + [getattr(args, n) for n in later[:-1]]):
+            setattr(args, name, value)
+        args.where_pos = None
 
     # Fold positional forms into the --flag attributes; giving both is an error.
-    for name in ("sport", "date", "time", "court"):
+    for name in ("sport", "where", "date", "time", "court"):
         pos = getattr(args, f"{name}_pos", None)
         if pos is None:
             continue
@@ -2063,37 +2138,42 @@ examples:
             parser.error(f"{name} given both positionally ({pos!r}) and as --{name}")
         setattr(args, name, pos)
 
-    try:
-        if args.command == "login":
-            asyncio.run(cmd_login(manual=args.manual, headless=not args.headed))
-        elif args.command == "status":
-            asyncio.run(cmd_status(headless=not args.headed))
-        elif args.command == "cancel":
-            asyncio.run(cmd_cancel(headless=not args.headed))
-        elif args.command == "inspect":
-            asyncio.run(cmd_inspect(sport=args.sport, date_str=args.date, headless=not args.headed))
-        elif args.command == "list":
-            asyncio.run(cmd_list(
-                sport=args.sport,
-                date_str=args.date,
-                headless=not args.headed,
-            ))
-        elif args.command == "book":
-            asyncio.run(cmd_book(
-                sport=args.sport,
-                date_str=args.date,
-                time_str=args.time,
-                court_str=args.court,
-                headless=not args.headed,
-                dry_run=args.dry_run,
-            ))
-    except PlaywrightTimeout as exc:
-        # Usually a slow or dropped connection; avoid dumping a traceback.
-        m = re.search(r"Timeout (\d+)ms exceeded", str(exc))
-        secs = int(m.group(1)) // 1000 if m else DEFAULT_PAGE_TIMEOUT_SECS
-        print(f"\nError: Page failed to load in {secs} seconds. "
-              "Please check your network connection and try again.")
-        sys.exit(1)
+    # Leaving WHERE out means SCRC. It's only asked for when nothing after it
+    # was given either (and inspect never asks).
+    if later and args.where is None and (args.date is not None or args.command == "inspect"):
+        args.where = "scrc"
+
+    if args.command == "login":
+        run(cmd_login(manual=args.manual, headless=not args.headed))
+    elif args.command == "status":
+        run(cmd_status(headless=not args.headed))
+    elif args.command == "cancel":
+        run(cmd_cancel(headless=not args.headed))
+    elif args.command == "inspect":
+        run(cmd_inspect(sport=args.sport, where=args.where, date_str=args.date,
+                        headless=not args.headed))
+    elif args.command == "list":
+        run(cmd_list(
+            sport=args.sport,
+            where=args.where,
+            date_str=args.date,
+            headless=not args.headed,
+        ))
+    elif args.command == "book":
+        run(cmd_book(
+            sport=args.sport,
+            where=args.where,
+            date_str=args.date,
+            time_str=args.time,
+            court_str=args.court,
+            headless=not args.headed,
+            dry_run=args.dry_run,
+        ))
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # On Windows a Ctrl+C at a prompt can land just after the prompt
+        # already gave up with EOFError, outside the handlers above.
+        sys.exit(130)
